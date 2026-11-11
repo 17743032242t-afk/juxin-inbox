@@ -1,5 +1,5 @@
 import type { ComponentChildren, JSX } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { Hub } from '../core/hub.ts';
 
 /** 订阅汇总中心：数据一变就重新渲染 */
@@ -12,6 +12,20 @@ export function useHub(hub: Hub): number {
     return off;
   }, [hub]);
   return version;
+}
+
+/**
+ * 只订阅一个会话：这个会话（或账号级的东西）变了才重新渲染。
+ * 开着几十个独立窗口时，每个窗口只为自己的会话干活，互不拖累。
+ */
+export function useChat(hub: Hub, key: string): void {
+  const [, setTick] = useState(0);
+  // 用同步的副作用订阅，避免「渲染完到订阅上」之间漏掉变化
+  useLayoutEffect(() => {
+    const off = hub.subscribeKey(key, () => setTick((n) => n + 1));
+    setTick((n) => n + 1);
+    return off;
+  }, [hub, key]);
 }
 
 const WEEKDAYS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
@@ -109,7 +123,9 @@ type IconName =
   | 'batch'
   | 'shield'
   | 'users'
-  | 'mute';
+  | 'mute'
+  | 'popout'
+  | 'smile';
 
 const PATHS: Record<IconName, string> = {
   lock: 'M7 10V7a5 5 0 0 1 10 0v3M6 10h12a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1v-8a1 1 0 0 1 1-1z',
@@ -134,6 +150,8 @@ const PATHS: Record<IconName, string> = {
   shield: 'M12 3l7 3v6c0 4.5-3 7.6-7 9-4-1.4-7-4.5-7-9V6zM9 12l2 2 4-4',
   users: 'M9 11a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM2.5 20a6.5 6.5 0 0 1 13 0M16 4.2a3.5 3.5 0 0 1 0 6.6M18 14.5a6.5 6.5 0 0 1 3.5 5.5',
   mute: 'M4 9v6h4l5 4V5L8 9zM17 9l4 6M21 9l-4 6',
+  popout: 'M14 4h6v6M20 4l-8 8M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5',
+  smile: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM8.5 14a4.5 4.5 0 0 0 7 0M9 9.5v1M15 9.5v1',
 };
 
 export function Icon(props: { name: IconName; size?: number }): JSX.Element {
@@ -146,15 +164,18 @@ export function Icon(props: { name: IconName; size?: number }): JSX.Element {
 }
 
 export function Modal(props: { title: string; onClose: () => void; children: ComponentChildren; wide?: boolean; locked?: boolean }): JSX.Element {
+  const overlay = useRef<HTMLDivElement>(null);
   useEffect(() => {
+    // 弹窗可能显示在独立窗口里，所以要监听它所在的那个窗口，而不是固定监听主窗口
+    const doc = overlay.current?.ownerDocument ?? document;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && !props.locked) props.onClose();
     };
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
+    doc.addEventListener('keydown', onKey);
+    return () => doc.removeEventListener('keydown', onKey);
   }, [props.onClose, props.locked]);
   return (
-    <div class="overlay" onMouseDown={(e) => { if (e.target === e.currentTarget && !props.locked) props.onClose(); }}>
+    <div class="overlay" ref={overlay} onMouseDown={(e) => { if (e.target === e.currentTarget && !props.locked) props.onClose(); }}>
       <div class={`modal${props.wide ? ' modal-wide' : ''}`} role="dialog" aria-modal="true" aria-label={props.title}>
         <header class="modal-head">
           <h2>{props.title}</h2>

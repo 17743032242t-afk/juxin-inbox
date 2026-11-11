@@ -1,12 +1,14 @@
 import type { JSX } from 'preact';
-import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { batchCandidates, batchExclusions } from '../core/batch.ts';
-import type { AccountView, Hub, InboxDialog } from '../core/hub.ts';
+import type { AccountView, Hub } from '../core/hub.ts';
 import type { Vault } from '../core/vault.ts';
 import { ChatView } from './chat.tsx';
+import { DialogRow } from './dialog-row.tsx';
+import { PopoutManager } from './popout.tsx';
 import { AccountsModal, AddAccountModal, BatchModal, QuickRepliesModal, SettingsModal } from './modals.tsx';
 import { APP_NAME, ApiSetup } from './screens.tsx';
-import { AccountChip, Avatar, Icon, listTime, useHub } from './util.tsx';
+import { Icon, useHub } from './util.tsx';
 
 /** 嵌在别的页面里展示（单文件演示）时为 true：不碰浏览器的前进后退记录 */
 declare const __EMBED__: boolean;
@@ -20,38 +22,6 @@ type ModalState =
   | { kind: 'quick' }
   | { kind: 'batch' }
   | { kind: 'settings' };
-
-function preview(d: InboxDialog): string {
-  const m = d.last;
-  if (!m) return '';
-  const body = m.text || m.media || '';
-  if (m.out) return `我：${body}`;
-  if (m.sender) return `${m.sender}：${body}`;
-  return body;
-}
-
-function DialogRow(props: { d: InboxDialog; account: AccountView | undefined; active: boolean; onOpen: () => void }): JSX.Element {
-  const { d, account } = props;
-  return (
-    <li>
-      <button class={`dialog${props.active ? ' active' : ''}${d.unread > 0 ? ' unread' : ''}`} onClick={props.onOpen} style={{ '--acct': account?.color ?? 'transparent' }}>
-        <Avatar title={d.title} badgeColor={account?.color} />
-        <span class="dialog-main">
-          <span class="dialog-top">
-            <span class="dialog-title">{d.title}</span>
-            {d.muted ? <span class="muted-mark"><Icon name="mute" size={14} /></span> : null}
-            <time>{d.last ? listTime(d.last.date) : ''}</time>
-          </span>
-          <span class="dialog-bottom">
-            {account ? <AccountChip label={account.label} color={account.color} small /> : null}
-            <span class="dialog-preview">{preview(d)}</span>
-            {d.unread > 0 ? <span class={`badge${d.muted ? ' quiet' : ''}`}>{d.unread > 99 ? '99+' : d.unread}</span> : null}
-          </span>
-        </span>
-      </button>
-    </li>
-  );
-}
 
 export interface WorkspaceProps {
   vault: Vault;
@@ -72,6 +42,26 @@ export function Workspace(props: WorkspaceProps): JSX.Element {
   const [limit, setLimit] = useState(LIST_PAGE);
   const [modal, setModal] = useState<ModalState>({ kind: 'none' });
   const lastActive = useRef(Date.now());
+  const [notice, setNotice] = useState<string | null>(null);
+
+  // 独立窗口管理器：跟随这次解锁存在，上锁（本组件卸载）时把所有独立窗口一起关掉
+  const popouts = useMemo(
+    () =>
+      new PopoutManager({
+        hub,
+        vault,
+        onActivity: () => {
+          lastActive.current = Date.now();
+        },
+        onManageQuick: () => {
+          window.focus();
+          setModal({ kind: 'quick' });
+        },
+      }),
+    [hub, vault],
+  );
+  useEffect(() => () => popouts.destroy(), [popouts]);
+  const canPopout = !__EMBED__ && !window.matchMedia('(pointer: coarse)').matches;
 
   const accounts = hub.accounts();
   const accountMap = useMemo(() => new Map(accounts.map((a) => [a.id, a])), [hub.version]);
@@ -177,7 +167,7 @@ export function Workspace(props: WorkspaceProps): JSX.Element {
     return () => window.removeEventListener('popstate', onPop);
   }, [hub]);
 
-  const open = (key: string) => {
+  const open = useCallback((key: string) => {
     if (!hub.activeKey && !__EMBED__) {
       try {
         history.pushState({ chat: true }, '');
@@ -186,11 +176,36 @@ export function Workspace(props: WorkspaceProps): JSX.Element {
       }
     }
     void hub.openChat(key);
-  };
-  const back = () => {
+  }, [hub]);
+  const back = useCallback(() => {
     if (!__EMBED__ && history.state?.chat) history.back();
     else void hub.openChat(null);
-  };
+  }, [hub]);
+  const manageQuick = useCallback(() => setModal({ kind: 'quick' }), []);
+
+  /** 在独立窗口打开一个会话；如果它正开在主窗口，就从主窗口收起，避免同一个会话显示两份 */
+  const popoutChat = useCallback(
+    (key: string) => {
+      if (!popouts.open({ kind: 'chat', key })) {
+        setNotice('浏览器拦截了新窗口。请在地址栏右侧允许本网站弹出窗口，然后再试一次。');
+        return;
+      }
+      setNotice(null);
+      if (hub.activeKey === key) {
+        if (!__EMBED__ && history.state?.chat) history.back();
+        else void hub.openChat(null);
+      }
+    },
+    [hub, popouts],
+  );
+  const popoutAccount = useCallback(
+    (accountId: string) => {
+      if (popouts.open({ kind: 'account', accountId })) setNotice(null);
+      else setNotice('浏览器拦截了新窗口。请在地址栏右侧允许本网站弹出窗口，然后再试一次。');
+    },
+    [popouts],
+  );
+  const poppedKeys = hub.poppedOutKeys();
 
   if (!vault.data.api) {
     return (
@@ -239,7 +254,13 @@ export function Workspace(props: WorkspaceProps): JSX.Element {
         </button>
         <div class="rail-accounts">
           {accounts.map((a) => (
-            <button key={a.id} class={`rail-item${filter === a.id ? ' on' : ''}`} onClick={() => setFilter(filter === a.id ? null : a.id)} title={`${a.label}（${a.name}）`}>
+            <button
+              key={a.id}
+              class={`rail-item${filter === a.id ? ' on' : ''}`}
+              onClick={() => setFilter(filter === a.id ? null : a.id)}
+              onDblClick={canPopout ? () => popoutAccount(a.id) : undefined}
+              title={canPopout ? `${a.label}（${a.name}）· 双击在独立窗口打开` : `${a.label}（${a.name}）`}
+            >
               <span class="rail-icon" style={{ background: a.color }}>
                 {[...a.label][0]}
                 {a.unread > 0 ? <span class="badge">{a.unread > 99 ? '99+' : a.unread}</span> : null}
@@ -262,6 +283,11 @@ export function Workspace(props: WorkspaceProps): JSX.Element {
         <header class="list-head">
           <div class="list-title">
             <h1>{filterAccount ? filterAccount.label : '全部消息'}</h1>
+            {filterAccount && canPopout ? (
+              <button class="icon-btn head-action" onClick={() => popoutAccount(filterAccount.id)} title="在独立窗口打开这个账号" aria-label="在独立窗口打开这个账号">
+                <Icon name="popout" size={18} />
+              </button>
+            ) : null}
             {props.demo ? <span class="demo-tag">演示模式 · 数据为虚构</span> : null}
             <span class="head-tools">{tools}</span>
           </div>
@@ -282,6 +308,11 @@ export function Workspace(props: WorkspaceProps): JSX.Element {
           </div>
         </header>
 
+        {notice ? (
+          <button class="banner warn as-button" onClick={() => setNotice(null)}>
+            {notice}
+          </button>
+        ) : null}
         {problem.length > 0 ? (
           <button class="banner warn as-button" onClick={() => setModal({ kind: 'accounts' })}>
             {problem.map((a) => `「${a.label}」`).join('、')} 需要处理：{problem[0]!.status === 'revoked' ? '登录已失效' : '连接出错'}。点这里查看。
@@ -302,7 +333,16 @@ export function Workspace(props: WorkspaceProps): JSX.Element {
         ) : (
           <ul class="dialogs">
             {shown.map((d) => (
-              <DialogRow key={d.key} d={d} account={accountMap.get(d.accountId)} active={d.key === hub.activeKey} onOpen={() => open(d.key)} />
+              <DialogRow
+                key={d.key}
+                d={d}
+                accountLabel={accountMap.get(d.accountId)?.label ?? null}
+                accountColor={accountMap.get(d.accountId)?.color ?? null}
+                active={d.key === hub.activeKey}
+                popped={poppedKeys.has(d.key)}
+                onOpen={open}
+                onPopout={canPopout ? popoutChat : undefined}
+              />
             ))}
             {filtered.length > shown.length ? (
               <li>
@@ -318,12 +358,12 @@ export function Workspace(props: WorkspaceProps): JSX.Element {
       {active && activeAccount ? (
         <ChatView
           hub={hub}
-          dialog={active}
-          account={activeAccount}
+          chatKey={active.key}
           quickReplies={vault.data.quickReplies}
           settings={vault.data.settings}
           onBack={back}
-          onManageQuick={() => setModal({ kind: 'quick' })}
+          onManageQuick={manageQuick}
+          onPopout={canPopout ? popoutChat : undefined}
         />
       ) : (
         <section class="chat placeholder">

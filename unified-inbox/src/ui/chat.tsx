@@ -1,9 +1,11 @@
 import type { JSX } from 'preact';
-import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
+import { memo } from 'preact/compat';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { AccountView, Hub, InboxDialog } from '../core/hub.ts';
 import { errorText, type MessageInfo } from '../core/types.ts';
 import type { QuickReply, Settings } from '../core/vault.ts';
-import { AccountChip, Avatar, ErrorNote, Icon, Modal, clockTime, dayLabel, sameDay, withPhotoSlot } from './util.tsx';
+import { EMOJI_GROUPS } from './emoji.ts';
+import { AccountChip, Avatar, ErrorNote, Icon, Modal, clockTime, dayLabel, sameDay, useChat, withPhotoSlot } from './util.tsx';
 
 const MAX_FILE_BYTES = 50 * 1024 * 1024;
 const URL_RE = /(https?:\/\/[^\s<>"'，。；！？）】]+)/g;
@@ -25,7 +27,9 @@ function RichText(props: { text: string }): JSX.Element {
             target="_blank"
             rel="noopener noreferrer nofollow"
             onClick={(e) => {
-              if (!window.confirm(`即将在浏览器中打开外部链接：\n\n${part}\n\n请确认这个网址可信。`)) e.preventDefault();
+              // 在链接所在的那个窗口里询问（会话可能开在独立窗口）
+              const view = e.currentTarget.ownerDocument.defaultView ?? window;
+              if (!view.confirm(`即将在浏览器中打开外部链接：\n\n${part}\n\n请确认这个网址可信。`)) e.preventDefault();
             }}
           >
             {part}
@@ -103,13 +107,14 @@ interface BubbleProps {
   read: boolean;
   quoted: MessageInfo | null;
   selected: boolean;
-  onSelect: () => void;
-  onReply: () => void;
-  onEdit: () => void;
-  onDelete: () => void;
+  /** 所有气泡共用同一个回调（身份不变），这样没变化的气泡可以整个跳过重画 */
+  onAction: (action: BubbleAction, msg: MessageInfo) => void;
 }
 
-function Bubble(props: BubbleProps): JSX.Element {
+type BubbleAction = 'select' | 'reply' | 'edit' | 'delete';
+
+/** 单条消息。内容没变就不重画：一个会话里有几百条消息时，来一条新消息只画这一条。 */
+const Bubble = memo(function Bubble(props: BubbleProps): JSX.Element {
   const { msg } = props;
   const [confirmDelete, setConfirmDelete] = useState(false);
   useEffect(() => {
@@ -121,7 +126,7 @@ function Bubble(props: BubbleProps): JSX.Element {
   const replyText = msg.replyTo ? msg.replyTo.quote || props.quoted?.text || props.quoted?.media || '一条较早的消息' : null;
   return (
     <div class={`msg ${msg.out ? 'out' : 'in'}${props.selected ? ' selected' : ''}`} data-mid={msg.id}>
-      <div class="bubble" onClick={props.onSelect}>
+      <div class="bubble" onClick={() => props.onAction('select', msg)}>
         {msg.sender ? <div class="sender">{msg.sender}</div> : null}
         {replyText !== null ? <div class="quote">{replyText}</div> : null}
         {msg.hasPhoto ? <Photo hub={props.hub} chatKey={props.chatKey} messageId={msg.id} /> : msg.media ? <div class="media-label">{msg.media}</div> : null}
@@ -142,7 +147,7 @@ function Bubble(props: BubbleProps): JSX.Element {
       </div>
       {props.selected ? (
         <div class="msg-actions">
-          <button type="button" onClick={props.onReply}>
+          <button type="button" onClick={() => props.onAction('reply', msg)}>
             <Icon name="reply" size={16} /> 回复
           </button>
           {msg.text ? (
@@ -151,12 +156,12 @@ function Bubble(props: BubbleProps): JSX.Element {
             </button>
           ) : null}
           {msg.out && msg.text && !msg.media ? (
-            <button type="button" onClick={props.onEdit}>
+            <button type="button" onClick={() => props.onAction('edit', msg)}>
               <Icon name="edit" size={16} /> 修改
             </button>
           ) : null}
           {msg.out ? (
-            <button type="button" class="danger-text" onClick={() => (confirmDelete ? props.onDelete() : setConfirmDelete(true))}>
+            <button type="button" class="danger-text" onClick={() => (confirmDelete ? props.onAction('delete', msg) : setConfirmDelete(true))}>
               <Icon name="trash" size={16} /> {confirmDelete ? '确认删除（对方那边也会删）' : '删除'}
             </button>
           ) : null}
@@ -164,19 +169,32 @@ function Bubble(props: BubbleProps): JSX.Element {
       ) : null}
     </div>
   );
-}
+});
 
 export interface ChatProps {
   hub: Hub;
-  dialog: InboxDialog;
-  account: AccountView;
+  chatKey: string;
   quickReplies: QuickReply[];
   settings: Settings;
   onBack: () => void;
   onManageQuick: () => void;
+  /** 传了就在标题栏显示「在独立窗口打开」按钮 */
+  onPopout?: (key: string) => void;
 }
 
-export function ChatView(props: ChatProps): JSX.Element {
+/**
+ * 聊天窗口。只订阅自己这个会话：别的会话、别的账号来消息时，它完全不重画。
+ * 主窗口和独立窗口用的是同一个组件。
+ */
+export const ChatView = memo(function ChatView(props: ChatProps): JSX.Element | null {
+  useChat(props.hub, props.chatKey);
+  const dialog = props.hub.dialog(props.chatKey);
+  const account = dialog ? props.hub.account(dialog.accountId) : null;
+  if (!dialog || !account) return null;
+  return <ChatBody {...props} dialog={dialog} account={account} />;
+});
+
+function ChatBody(props: ChatProps & { dialog: InboxDialog; account: AccountView }): JSX.Element {
   const { hub, dialog, account } = props;
   const key = dialog.key;
   const messages = hub.messages(key);
@@ -188,6 +206,8 @@ export function ChatView(props: ChatProps): JSX.Element {
   const [replyTo, setReplyTo] = useState<MessageInfo | null>(null);
   const [editing, setEditing] = useState<MessageInfo | null>(null);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const [emojiOpen, setEmojiOpen] = useState(false);
+  const [dragging, setDragging] = useState(false);
   const scroller = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -203,6 +223,7 @@ export function ChatView(props: ChatProps): JSX.Element {
     setReplyTo(null);
     setEditing(null);
     setPendingFile(null);
+    setEmojiOpen(false);
     stick.current = true;
     prevFirstId.current = null;
     if (!isTouch()) input.current?.focus();
@@ -304,6 +325,51 @@ export function ChatView(props: ChatProps): JSX.Element {
     }
   };
 
+  // 气泡上的操作统一从这里走。回调本身的身份永远不变，里面用到的状态通过 ref 取最新值。
+  const actionRef = useRef<(action: BubbleAction, m: MessageInfo) => void>(() => {});
+  actionRef.current = (action, m) => {
+    if (action === 'select') {
+      setSelected(selected === m.id ? null : m.id);
+      return;
+    }
+    setSelected(null);
+    if (action === 'reply') {
+      setReplyTo(m);
+      setEditing(null);
+      input.current?.focus();
+    } else if (action === 'edit') {
+      setEditing(m);
+      setReplyTo(null);
+      setText(m.text);
+      input.current?.focus();
+    } else {
+      void run(() => hub.remove(key, m.id));
+    }
+  };
+  const onAction = useCallback((action: BubbleAction, m: MessageInfo) => actionRef.current(action, m), []);
+
+  const takeFile = (f: File | null | undefined) => {
+    if (!f || editing) return;
+    if (f.size > MAX_FILE_BYTES) return setError('文件超过 50MB，暂时不支持在这里发送。');
+    setError(null);
+    setPendingFile(f);
+  };
+
+  const insertEmoji = (emoji: string) => {
+    const el = input.current;
+    const start = el?.selectionStart ?? text.length;
+    const end = el?.selectionEnd ?? text.length;
+    const next = text.slice(0, start) + emoji + text.slice(end);
+    setText(next);
+    // 等输入框内容更新后，把光标放回表情后面，方便连续点
+    queueMicrotask(() => {
+      if (!el) return;
+      const pos = start + emoji.length;
+      el.setSelectionRange(pos, pos);
+      if (!isTouch()) el.focus();
+    });
+  };
+
   const byId = new Map(messages.map((m) => [m.id, m]));
   const rows: JSX.Element[] = [];
   let prev: MessageInfo | null = null;
@@ -324,24 +390,7 @@ export function ChatView(props: ChatProps): JSX.Element {
         read={m.out && m.id <= dialog.readOutboxMaxId}
         quoted={m.replyTo ? byId.get(m.replyTo.id) ?? null : null}
         selected={selected === m.id}
-        onSelect={() => setSelected(selected === m.id ? null : m.id)}
-        onReply={() => {
-          setReplyTo(m);
-          setEditing(null);
-          setSelected(null);
-          input.current?.focus();
-        }}
-        onEdit={() => {
-          setEditing(m);
-          setReplyTo(null);
-          setText(m.text);
-          setSelected(null);
-          input.current?.focus();
-        }}
-        onDelete={() => {
-          setSelected(null);
-          void run(() => hub.remove(key, m.id));
-        }}
+        onAction={onAction}
       />,
     );
     prev = m;
@@ -351,7 +400,25 @@ export function ChatView(props: ChatProps): JSX.Element {
   const canSend = dialog.canSend && account.status !== 'revoked';
 
   return (
-    <section class="chat" style={{ '--acct': account.color }}>
+    <section
+      class={`chat${dragging ? ' dragging' : ''}`}
+      style={{ '--acct': account.color }}
+      onDragOver={(e) => {
+        if (!canSend || !e.dataTransfer?.types.includes('Files')) return;
+        e.preventDefault();
+        setDragging(true);
+      }}
+      onDragLeave={(e) => {
+        if (e.currentTarget === e.target) setDragging(false);
+      }}
+      onDrop={(e) => {
+        setDragging(false);
+        if (!canSend || !e.dataTransfer?.files.length) return;
+        e.preventDefault();
+        takeFile(e.dataTransfer.files[0]);
+      }}
+    >
+      {dragging ? <div class="drop-hint">松开鼠标，把文件发给 {dialog.title}</div> : null}
       <header class="chat-head">
         <button class="icon-btn back" onClick={props.onBack} aria-label="返回">
           <Icon name="back" />
@@ -364,6 +431,11 @@ export function ChatView(props: ChatProps): JSX.Element {
             {dialog.kind === 'group' ? ' · 群聊' : dialog.kind === 'channel' ? ' · 频道' : dialog.kind === 'bot' ? ' · 机器人' : ''}
           </span>
         </div>
+        {props.onPopout && !isTouch() ? (
+          <button class="icon-btn head-action" onClick={() => props.onPopout?.(key)} title="在独立窗口打开这个会话" aria-label="在独立窗口打开这个会话">
+            <Icon name="popout" />
+          </button>
+        ) : null}
       </header>
 
       {offline ? (
@@ -430,6 +502,22 @@ export function ChatView(props: ChatProps): JSX.Element {
               <Icon name="edit" size={14} /> 管理快捷回复
             </button>
           </div>
+          {emojiOpen ? (
+            <div class="emoji-panel" role="group" aria-label="表情">
+              {EMOJI_GROUPS.map((g) => (
+                <div class="emoji-group" key={g.name}>
+                  <span class="emoji-group-name">{g.name}</span>
+                  <div class="emoji-grid">
+                    {g.items.map((em) => (
+                      <button key={em} type="button" class="emoji" onClick={() => insertEmoji(em)} aria-label={`表情 ${em}`}>
+                        {em}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : null}
           <div class="input-row">
             <button class="icon-btn" type="button" onClick={() => fileInput.current?.click()} aria-label="发送图片或文件" disabled={sending || !!editing}>
               <Icon name="attach" />
@@ -441,17 +529,25 @@ export function ChatView(props: ChatProps): JSX.Element {
               onChange={(e) => {
                 const f = e.currentTarget.files?.[0] ?? null;
                 e.currentTarget.value = '';
-                if (!f) return;
-                if (f.size > MAX_FILE_BYTES) return setError('文件超过 50MB，暂时不支持在这里发送。');
-                setPendingFile(f);
+                takeFile(f);
               }}
             />
+            <button class={`icon-btn${emojiOpen ? ' on' : ''}`} type="button" onClick={() => setEmojiOpen(!emojiOpen)} aria-label="表情" aria-expanded={emojiOpen} title="表情">
+              <Icon name="smile" />
+            </button>
             <textarea
               ref={input}
               rows={1}
               value={text}
               placeholder={`以「${account.label}」回复 ${dialog.title}`}
               onInput={(e) => setText(e.currentTarget.value)}
+              onPaste={(e) => {
+                // 直接粘贴截图或复制的文件
+                const f = e.clipboardData?.files[0];
+                if (!f) return;
+                e.preventDefault();
+                takeFile(f);
+              }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !isTouch()) {
                   e.preventDefault();
