@@ -11,18 +11,53 @@ async function shot(page, name) {
   if (SHOTS) await page.screenshot({ path: `${SHOTS}/${name}.png` });
 }
 
-async function addAccount(page, phone, label, { password, tooSoon } = {}) {
-  await page.waitForSelector('.modal input[type=tel]');
-  await page.fill('.modal input[type=tel]', phone);
+/** 走到「选择登录方式」这一步，处理节奏提醒 */
+async function chooseMethod(page, { tooSoon } = {}) {
+  await page.waitForSelector('.modal .methods');
   if (tooSoon) {
     // 刚登录完一个账号又来一个：给出风险提醒，不勾选确认就不能继续
     assert.match(await page.textContent('.modal .danger-box'), /建议再等 10 分钟/);
-    assert.equal(await page.isDisabled('.modal button[type=submit]'), true);
+    assert.equal(await page.isDisabled('.modal .method.primary'), true);
     await page.check('.modal .danger-box input[type=checkbox]');
   } else {
     assert.equal(await page.locator('.modal .danger-box').count(), 0);
   }
   assert.match(await page.textContent('.modal .tips'), /平时常用的网络/);
+}
+
+async function finishLabel(page, label) {
+  await page.waitForSelector('.modal input[placeholder*="客户号"]');
+  await page.fill('.modal input[placeholder*="客户号"]', label);
+  await page.click('.modal button[type=submit]');
+  await page.waitForSelector('.modal', { state: 'detached' });
+}
+
+/** 扫码登录（phone 是「拿手机扫码的那个账号」） */
+async function addAccountByQr(page, phone, label, { password, tooSoon } = {}) {
+  await chooseMethod(page, { tooSoon });
+  await page.click('.modal .method.primary');
+  await page.waitForSelector('.modal svg.qr');
+  assert.match(await page.textContent('.modal .steps'), /设置 → 设备 → 关联桌面设备/);
+  // 页面源码里不应把登录令牌写进任何属性或文字
+  assert.ok(!(await page.innerHTML('.modal')).includes('token='));
+  await shot(page, '02c-qr');
+  assert.equal(await page.evaluate((p) => window.__mockNet.scanQr(p), phone), true);
+  if (password) {
+    await page.waitForSelector('.modal input[type=password]');
+    await page.fill('.modal input[type=password]', 'wrong-one');
+    await page.click('.modal button[type=submit]');
+    await page.waitForSelector('.modal .error:has-text("两步验证密码不正确")');
+    await page.fill('.modal input[type=password]', password);
+    await page.click('.modal button[type=submit]');
+  }
+  await finishLabel(page, label);
+}
+
+async function addAccount(page, phone, label, { password, tooSoon } = {}) {
+  await chooseMethod(page, { tooSoon });
+  await page.click('.modal .method:not(.primary)');
+  await page.waitForSelector('.modal input[type=tel]');
+  await page.fill('.modal input[type=tel]', phone);
   await page.click('.modal button[type=submit]');
   await page.waitForSelector('.modal input[autocomplete=one-time-code]');
   await page.fill('.modal input[autocomplete=one-time-code]', '00000');
@@ -36,10 +71,7 @@ async function addAccount(page, phone, label, { password, tooSoon } = {}) {
     await page.fill('.modal input[type=password]', password);
     await page.click('.modal button[type=submit]');
   }
-  await page.waitForSelector('.modal input[placeholder*="客户号"]');
-  await page.fill('.modal input[placeholder*="客户号"]', label);
-  await page.click('.modal button[type=submit]');
-  await page.waitForSelector('.modal', { state: 'detached' });
+  await finishLabel(page, label);
 }
 
 let current = null;
@@ -83,11 +115,21 @@ async function main() {
   await page.fill('.api-setup input >> nth=1', '0123456789abcdef0123456789abcdef');
   await page.click('.api-setup button[type=submit]');
 
-  // 3. 连续添加两个账号（第二个带两步验证）
+  // 3. 连续添加两个账号：第一个用手机号验证码；第二个扫码登录（带两步验证，先输错一次）
   await addAccount(page, '+8613800000011', '客户号');
   await page.click('.rail-item[title="添加账号"]');
   await shot(page, '02b-add-account');
-  await addAccount(page, '+8613800000022', '供应商号', { password: 'mima1234', tooSoon: true });
+  // 3a. 扫码页可以取消：切到手机号方式再切回来，旧二维码作废、不会留下半截登录
+  await chooseMethod(page, { tooSoon: true });
+  await page.click('.modal .method.primary');
+  await page.waitForSelector('.modal svg.qr');
+  await page.click('.modal button:has-text("改用手机号登录")');
+  await page.waitForSelector('.modal input[type=tel]');
+  assert.equal(await page.evaluate(() => window.__mockNet.qrWaiters.length), 0);
+  await page.click('.modal-head .icon-btn');
+  await page.waitForSelector('.modal', { state: 'detached' });
+  await page.click('.rail-item[title="添加账号"]');
+  await addAccountByQr(page, '+8613800000022', '供应商号', { password: 'mima1234', tooSoon: true });
   await page.waitForFunction(() => document.querySelectorAll('.dialog').length === 4);
   assert.equal(await page.locator('.rail-accounts .rail-item').count(), 3); // 两个账号 + 添加按钮
   assert.equal(await page.title(), '(4) 聚信');

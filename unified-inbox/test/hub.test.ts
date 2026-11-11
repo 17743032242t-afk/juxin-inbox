@@ -297,3 +297,77 @@ test('新登录的账号有 24 小时保护期；「重要」标记会保存，�
   const reopened = await Vault.unlock(store, PASSWORD);
   assert.equal(reopened.data.accounts.find((x) => x.id === a)?.important, true);
 });
+
+function qrHandlers(log: string[], passwords: string[] = []) {
+  return {
+    onUrl: (url: string) => log.push(`url:${url.slice(0, 22)}`),
+    onScanned: () => log.push('scanned'),
+    askPassword: async (_hint: string | null, wrong: boolean) => {
+      log.push(wrong ? 'ask-again' : 'ask');
+      return passwords.shift() ?? '';
+    },
+  };
+}
+
+test('扫码登录：显示二维码 → 手机扫码 → 登录成功并开始收消息，不需要手机号和验证码', async () => {
+  const { hub, net, vault } = await setup();
+  const u = net.ensureUser(A, '甲').self.userId;
+  net.addChat(u, 101, '王老板');
+  net.seed(u, 101, '在吗', { unread: true });
+  const log: string[] = [];
+  const flow = hub.beginLogin();
+  const pending = flow.startQr(qrHandlers(log));
+  await flush();
+  assert.deepEqual(log, ['url:tg://login?token=MOCK-']);
+  assert.equal(vault.data.accounts.length, 0);
+  assert.equal(net.scanQr(A), true);
+  await pending;
+  assert.deepEqual(log.slice(1), ['scanned']);
+  const id = await flow.finish('客户号', null, true);
+  assert.equal(hub.account(id)?.phone, A);
+  assert.equal(hub.account(id)?.important, true);
+  assert.equal(hub.dialogs().length, 1);
+  net.deliver(u, 101, '还在吗');
+  await flush();
+  assert.equal(hub.dialog(dialogKey(id, 101))?.unread, 2);
+});
+
+test('扫码登录遇到两步验证：密码输错会再问一次，输对后登录成功', async () => {
+  const { hub, net } = await setup();
+  net.ensureUser('+8613800000022', '丙');
+  const log: string[] = [];
+  const flow = hub.beginLogin();
+  const pending = flow.startQr(qrHandlers(log, ['wrong', 'mima1234']));
+  await flush();
+  net.scanQr('+8613800000022');
+  await pending;
+  assert.deepEqual(log.slice(1), ['scanned', 'ask', 'ask-again']);
+  await flow.finish('两步号', null);
+  assert.equal(hub.accounts()[0]?.label, '两步号');
+});
+
+test('二维码还没人扫就取消：不留下任何账号，之后再扫也无效', async () => {
+  const { hub, net, vault } = await setup();
+  net.ensureUser(A, '甲');
+  const flow = hub.beginLogin();
+  const pending = flow.startQr(qrHandlers([]));
+  await flush();
+  await flow.cancel();
+  await assert.rejects(pending, (e: unknown) => e instanceof AppError && e.code === 'cancelled');
+  assert.equal(net.scanQr(A), false);
+  assert.equal(vault.data.accounts.length, 0);
+  assert.equal(net.revoked.size, 0);
+});
+
+test('扫码成功但没保存就取消：会在服务器上退出这份登录', async () => {
+  const { hub, net, vault } = await setup();
+  net.ensureUser(A, '甲');
+  const flow = hub.beginLogin();
+  const pending = flow.startQr(qrHandlers([]));
+  await flush();
+  net.scanQr(A);
+  await pending;
+  await flow.cancel();
+  assert.equal(vault.data.accounts.length, 0);
+  assert.equal(net.revoked.size, 1);
+});
