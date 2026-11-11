@@ -248,7 +248,7 @@ function AccountWindow(props: { ctx: PopoutContext; viewerId: string; accountId:
         ) : (
           <ul class="dialogs">
             {list.map((d) => (
-              <DialogRow key={d.key} d={d} accountLabel={null} accountColor={account.color} active={d.key === key} popped={popped.has(d.key) && d.key !== key} onOpen={open} onPopout={popout} />
+              <DialogRow key={d.key} hub={hub} d={d} accountLabel={null} accountColor={account.color} active={d.key === key} popped={popped.has(d.key) && d.key !== key} onOpen={open} onPopout={popout} />
             ))}
           </ul>
         )}

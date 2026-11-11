@@ -5,7 +5,9 @@ import type { AccountView, Hub, InboxDialog } from '../core/hub.ts';
 import { errorText, type MessageInfo } from '../core/types.ts';
 import type { QuickReply, Settings } from '../core/vault.ts';
 import { EMOJI_GROUPS } from './emoji.ts';
-import { AccountChip, Avatar, ErrorNote, Icon, Modal, clockTime, dayLabel, sameDay, useChat, withPhotoSlot } from './util.tsx';
+import { GroupModal } from './groups.tsx';
+import { AttachmentView, ChatAvatar, StickerPanel } from './media.tsx';
+import { AccountChip, ErrorNote, Icon, Modal, clockTime, dayLabel, sameDay, useChat, useHub, withPhotoSlot } from './util.tsx';
 
 const MAX_FILE_BYTES = 50 * 1024 * 1024;
 const URL_RE = /(https?:\/\/[^\s<>"'，。；！？）】]+)/g;
@@ -107,11 +109,14 @@ interface BubbleProps {
   read: boolean;
   quoted: MessageInfo | null;
   selected: boolean;
+  /** 多选模式：点气泡是勾选，不弹操作菜单 */
+  picking: boolean;
+  picked: boolean;
   /** 所有气泡共用同一个回调（身份不变），这样没变化的气泡可以整个跳过重画 */
   onAction: (action: BubbleAction, msg: MessageInfo) => void;
 }
 
-type BubbleAction = 'select' | 'reply' | 'edit' | 'delete';
+type BubbleAction = 'select' | 'reply' | 'edit' | 'delete' | 'forward' | 'pick';
 
 /** 单条消息。内容没变就不重画：一个会话里有几百条消息时，来一条新消息只画这一条。 */
 const Bubble = memo(function Bubble(props: BubbleProps): JSX.Element {
@@ -124,12 +129,19 @@ const Bubble = memo(function Bubble(props: BubbleProps): JSX.Element {
     return <div class="service">{msg.media ?? '系统消息'}</div>;
   }
   const replyText = msg.replyTo ? msg.replyTo.quote || props.quoted?.text || props.quoted?.media || '一条较早的消息' : null;
+  const isSticker = msg.attachment?.kind === 'sticker';
   return (
-    <div class={`msg ${msg.out ? 'out' : 'in'}${props.selected ? ' selected' : ''}`} data-mid={msg.id}>
-      <div class="bubble" onClick={() => props.onAction('select', msg)}>
+    <div class={`msg ${msg.out ? 'out' : 'in'}${props.selected || props.picked ? ' selected' : ''}${isSticker ? ' sticker-msg' : ''}`} data-mid={msg.id}>
+      <div class="bubble" onClick={() => props.onAction(props.picking ? 'pick' : 'select', msg)} role={props.picking ? 'checkbox' : undefined} aria-checked={props.picking ? props.picked : undefined}>
         {msg.sender ? <div class="sender">{msg.sender}</div> : null}
         {replyText !== null ? <div class="quote">{replyText}</div> : null}
-        {msg.hasPhoto ? <Photo hub={props.hub} chatKey={props.chatKey} messageId={msg.id} /> : msg.media ? <div class="media-label">{msg.media}</div> : null}
+        {msg.hasPhoto ? (
+          <Photo hub={props.hub} chatKey={props.chatKey} messageId={msg.id} />
+        ) : msg.attachment ? (
+          <AttachmentView hub={props.hub} chatKey={props.chatKey} messageId={msg.id} info={msg.attachment} />
+        ) : msg.media ? (
+          <div class="media-label">{msg.media}</div>
+        ) : null}
         {msg.text ? (
           <div class="text">
             <RichText text={msg.text} />
@@ -145,10 +157,16 @@ const Bubble = memo(function Bubble(props: BubbleProps): JSX.Element {
           ) : null}
         </div>
       </div>
-      {props.selected ? (
+      {props.selected && !props.picking ? (
         <div class="msg-actions">
           <button type="button" onClick={() => props.onAction('reply', msg)}>
             <Icon name="reply" size={16} /> 回复
+          </button>
+          <button type="button" onClick={() => props.onAction('forward', msg)}>
+            <Icon name="forward" size={16} /> 转发
+          </button>
+          <button type="button" onClick={() => props.onAction('pick', msg)}>
+            <Icon name="check" size={16} /> 多选
           </button>
           {msg.text ? (
             <button type="button" onClick={() => void navigator.clipboard?.writeText(msg.text)}>
@@ -170,6 +188,55 @@ const Bubble = memo(function Bubble(props: BubbleProps): JSX.Element {
     </div>
   );
 });
+
+/** 选择转发到哪个会话：只列出同一个账号里能发言的会话 */
+function ForwardModal(props: { hub: Hub; fromKey: string; accountId: string; count: number; onClose: () => void; onPick: (toKey: string, title: string) => Promise<void> }): JSX.Element {
+  useHub(props.hub);
+  const [search, setSearch] = useState('');
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const account = props.hub.account(props.accountId);
+  const needle = search.trim().toLowerCase();
+  const targets = props.hub
+    .dialogs()
+    .filter((d) => d.accountId === props.accountId && d.canSend && d.key !== props.fromKey && (!needle || d.title.toLowerCase().includes(needle)))
+    .slice(0, 100);
+  const pick = async (toKey: string, title: string) => {
+    if (busy) return;
+    setBusy(toKey);
+    setError(null);
+    try {
+      await props.onPick(toKey, title);
+    } catch (e) {
+      setError(errorText(e));
+      setBusy(null);
+    }
+  };
+  return (
+    <Modal title={`转发 ${props.count} 条消息`} onClose={props.onClose} locked={busy !== null}>
+      <p class="hint">
+        转发在同一个账号内进行{account ? <>（<AccountChip label={account.label} color={account.color} small />）</> : null}。选一个会话，点一下就转过去。
+      </p>
+      <div class="search">
+        <Icon name="search" size={18} />
+        <input type="search" value={search} onInput={(e) => setSearch(e.currentTarget.value)} placeholder="搜索会话" aria-label="搜索会话" autofocus />
+      </div>
+      <ErrorNote text={error} />
+      <ul class="pick-list">
+        {targets.map((d) => (
+          <li key={d.key}>
+            <button type="button" class="pick-row" disabled={busy !== null} onClick={() => void pick(d.key, d.title)}>
+              <ChatAvatar hub={props.hub} chatKey={d.key} title={d.title} hasAvatar={d.hasAvatar} size={36} />
+              <b>{d.title}</b>
+              <small>{busy === d.key ? '正在转发…' : d.kind === 'group' ? '群聊' : d.kind === 'self' ? '' : ''}</small>
+            </button>
+          </li>
+        ))}
+        {targets.length === 0 ? <li class="hint">没有可以转发到的会话。</li> : null}
+      </ul>
+    </Modal>
+  );
+}
 
 export interface ChatProps {
   hub: Hub;
@@ -207,7 +274,15 @@ function ChatBody(props: ChatProps & { dialog: InboxDialog; account: AccountView
   const [editing, setEditing] = useState<MessageInfo | null>(null);
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [emojiOpen, setEmojiOpen] = useState(false);
+  const [panelTab, setPanelTab] = useState<'emoji' | 'sticker'>('emoji');
   const [dragging, setDragging] = useState(false);
+  /** 多选模式下勾中的消息；null 表示不在多选模式 */
+  const [picked, setPicked] = useState<Set<number> | null>(null);
+  /** 等待选择「转发到哪里」的消息 */
+  const [forwarding, setForwarding] = useState<number[] | null>(null);
+  const [groupOpen, setGroupOpen] = useState(false);
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
   const scroller = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -224,6 +299,10 @@ function ChatBody(props: ChatProps & { dialog: InboxDialog; account: AccountView
     setEditing(null);
     setPendingFile(null);
     setEmojiOpen(false);
+    setPicked(null);
+    setForwarding(null);
+    setGroupOpen(false);
+    setNotice(null);
     stick.current = true;
     prevFirstId.current = null;
     if (!isTouch()) input.current?.focus();
@@ -332,7 +411,20 @@ function ChatBody(props: ChatProps & { dialog: InboxDialog; account: AccountView
       setSelected(selected === m.id ? null : m.id);
       return;
     }
+    if (action === 'pick') {
+      // 进入多选，或在多选里勾选 / 取消勾选
+      const next = new Set(picked ?? []);
+      if (next.has(m.id)) next.delete(m.id);
+      else next.add(m.id);
+      setPicked(next);
+      setSelected(null);
+      return;
+    }
     setSelected(null);
+    if (action === 'forward') {
+      setForwarding([m.id]);
+      return;
+    }
     if (action === 'reply') {
       setReplyTo(m);
       setEditing(null);
@@ -390,12 +482,15 @@ function ChatBody(props: ChatProps & { dialog: InboxDialog; account: AccountView
         read={m.out && m.id <= dialog.readOutboxMaxId}
         quoted={m.replyTo ? byId.get(m.replyTo.id) ?? null : null}
         selected={selected === m.id}
+        picking={picked !== null}
+        picked={picked?.has(m.id) ?? false}
         onAction={onAction}
       />,
     );
     prev = m;
   }
 
+  const pickedMine = picked ? messages.filter((m) => m.out && picked.has(m.id)).length : 0;
   const offline = account.status !== 'online';
   const canSend = dialog.canSend && account.status !== 'revoked';
 
@@ -423,14 +518,23 @@ function ChatBody(props: ChatProps & { dialog: InboxDialog; account: AccountView
         <button class="icon-btn back" onClick={props.onBack} aria-label="返回">
           <Icon name="back" />
         </button>
-        <Avatar title={dialog.title} size={40} />
+        <ChatAvatar hub={hub} chatKey={key} title={dialog.title} hasAvatar={dialog.hasAvatar} size={40} />
         <div class="chat-title">
           <strong>{dialog.title}</strong>
           <span class="via">
             通过 <AccountChip label={account.label} color={account.color} small /> 收发
+            <span class="via-who">
+              （{account.name}
+              {account.phone ? ` · 尾号 ${account.phone.slice(-4)}` : ''}）
+            </span>
             {dialog.kind === 'group' ? ' · 群聊' : dialog.kind === 'channel' ? ' · 频道' : dialog.kind === 'bot' ? ' · 机器人' : ''}
           </span>
         </div>
+        {dialog.kind === 'group' ? (
+          <button class={`icon-btn head-action${props.onPopout && !isTouch() ? ' pair' : ''}`} onClick={() => setGroupOpen(true)} title="群管理" aria-label="群管理">
+            <Icon name="users" />
+          </button>
+        ) : null}
         {props.onPopout && !isTouch() ? (
           <button class="icon-btn head-action" onClick={() => props.onPopout?.(key)} title="在独立窗口打开这个会话" aria-label="在独立窗口打开这个会话">
             <Icon name="popout" />
@@ -464,7 +568,50 @@ function ChatBody(props: ChatProps & { dialog: InboxDialog; account: AccountView
         {history.loaded && !history.loading && messages.length === 0 ? <div class="empty">还没有消息</div> : null}
       </div>
 
-      {canSend ? (
+      {notice ? (
+        <button class="banner as-button" onClick={() => setNotice(null)}>
+          {notice}
+        </button>
+      ) : null}
+      {picked !== null ? (
+        <footer class="composer select-bar">
+          <ErrorNote text={error} />
+          <span class="select-count">已选 {picked.size} 条</span>
+          <button class="btn small" disabled={picked.size === 0 || sending} onClick={() => setForwarding([...picked])}>
+            <Icon name="forward" size={15} /> 转发
+          </button>
+          <button
+            class="btn small"
+            disabled={picked.size === 0}
+            onClick={() => {
+              const lines = messages.filter((m) => picked.has(m.id) && m.text).map((m) => m.text);
+              void navigator.clipboard?.writeText(lines.join('\n'));
+              setNotice(`已复制 ${lines.length} 条文字。`);
+              setPicked(null);
+            }}
+          >
+            <Icon name="copy" size={15} /> 复制
+          </button>
+          <button
+            class="btn small danger-outline"
+            disabled={pickedMine === 0 || sending}
+            onClick={() => {
+              if (!confirmBulkDelete) return setConfirmBulkDelete(true);
+              setConfirmBulkDelete(false);
+              void run(async () => {
+                const n = await hub.removeMany(key, [...picked]);
+                setNotice(`已删除 ${n} 条自己发的消息。`);
+                setPicked(null);
+              });
+            }}
+          >
+            <Icon name="trash" size={15} /> {confirmBulkDelete ? `确认删除 ${pickedMine} 条（对方那边也会删）` : `删除${pickedMine > 0 ? `（${pickedMine}）` : ''}`}
+          </button>
+          <button class="btn small" onClick={() => { setPicked(null); setConfirmBulkDelete(false); }}>
+            取消
+          </button>
+        </footer>
+      ) : canSend ? (
         <footer class="composer">
           <ErrorNote text={error} />
           {replyTo ? (
@@ -503,19 +650,37 @@ function ChatBody(props: ChatProps & { dialog: InboxDialog; account: AccountView
             </button>
           </div>
           {emojiOpen ? (
-            <div class="emoji-panel" role="group" aria-label="表情">
-              {EMOJI_GROUPS.map((g) => (
-                <div class="emoji-group" key={g.name}>
-                  <span class="emoji-group-name">{g.name}</span>
-                  <div class="emoji-grid">
-                    {g.items.map((em) => (
-                      <button key={em} type="button" class="emoji" onClick={() => insertEmoji(em)} aria-label={`表情 ${em}`}>
-                        {em}
-                      </button>
-                    ))}
+            <div class="emoji-panel" role="group" aria-label="表情和贴纸">
+              <div class="tabs panel-tabs" role="tablist">
+                <button role="tab" aria-selected={panelTab === 'emoji'} class={panelTab === 'emoji' ? 'on' : ''} onClick={() => setPanelTab('emoji')}>表情</button>
+                <button role="tab" aria-selected={panelTab === 'sticker'} class={panelTab === 'sticker' ? 'on' : ''} onClick={() => setPanelTab('sticker')}>贴纸</button>
+              </div>
+              {panelTab === 'emoji' ? (
+                EMOJI_GROUPS.map((g) => (
+                  <div class="emoji-group" key={g.name}>
+                    <span class="emoji-group-name">{g.name}</span>
+                    <div class="emoji-grid">
+                      {g.items.map((em) => (
+                        <button key={em} type="button" class="emoji" onClick={() => insertEmoji(em)} aria-label={`表情 ${em}`}>
+                          {em}
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                </div>
-              ))}
+                ))
+              ) : (
+                <StickerPanel
+                  hub={hub}
+                  accountId={dialog.accountId}
+                  disabled={sending || !!editing}
+                  onPick={(stickerId) => {
+                    stick.current = true;
+                    const reply = replyTo;
+                    setReplyTo(null);
+                    void run(() => hub.sendSticker(key, stickerId, { replyToId: reply?.id }));
+                  }}
+                />
+              )}
             </div>
           ) : null}
           <div class="input-row">
@@ -564,6 +729,22 @@ function ChatBody(props: ChatProps & { dialog: InboxDialog; account: AccountView
         <footer class="composer readonly">{account.status === 'revoked' ? '账号登录已失效，无法发送。' : '这个会话只能查看，不能发言。'}</footer>
       )}
 
+      {forwarding ? (
+        <ForwardModal
+          hub={hub}
+          fromKey={key}
+          accountId={dialog.accountId}
+          count={forwarding.length}
+          onClose={() => setForwarding(null)}
+          onPick={async (toKey, title) => {
+            const n = await hub.forward(key, forwarding, toKey);
+            setForwarding(null);
+            setPicked(null);
+            setNotice(`已转发 ${n} 条给「${title}」。`);
+          }}
+        />
+      ) : null}
+      {groupOpen ? <GroupModal hub={hub} chatKey={key} onClose={() => setGroupOpen(false)} /> : null}
       {pendingFile ? (
         <Modal title="发送文件" onClose={() => (sending ? undefined : setPendingFile(null))} locked={sending}>
           <p>

@@ -5,6 +5,8 @@ import type { AccountView, Hub } from '../core/hub.ts';
 import type { Vault } from '../core/vault.ts';
 import { ChatView } from './chat.tsx';
 import { DialogRow } from './dialog-row.tsx';
+import { NewGroupModal } from './groups.tsx';
+import { releaseAvatars } from './media.tsx';
 import { PopoutManager } from './popout.tsx';
 import { AccountsModal, AddAccountModal, BatchModal, QuickRepliesModal, SettingsModal } from './modals.tsx';
 import { APP_NAME, ApiSetup } from './screens.tsx';
@@ -21,6 +23,7 @@ type ModalState =
   | { kind: 'accounts' }
   | { kind: 'quick' }
   | { kind: 'batch' }
+  | { kind: 'group' }
   | { kind: 'settings' };
 
 export interface WorkspaceProps {
@@ -60,7 +63,14 @@ export function Workspace(props: WorkspaceProps): JSX.Element {
       }),
     [hub, vault],
   );
-  useEffect(() => () => popouts.destroy(), [popouts]);
+  useEffect(
+    () => () => {
+      popouts.destroy();
+      // 上锁时把已加载的头像图片也一并清掉
+      releaseAvatars();
+    },
+    [popouts],
+  );
   const canPopout = !__EMBED__ && !window.matchMedia('(pointer: coarse)').matches;
 
   const accounts = hub.accounts();
@@ -302,6 +312,9 @@ export function Workspace(props: WorkspaceProps): JSX.Element {
                 未读{totalUnread > 0 ? ` ${filterAccount ? filterAccount.unread : totalUnread}` : ''}
               </button>
             </div>
+            <button class="btn small icon-only" onClick={() => setModal({ kind: 'group' })} disabled={accounts.length === 0} title="新建群" aria-label="新建群">
+              <Icon name="group-add" size={16} />
+            </button>
             <button class="btn small" onClick={() => setModal({ kind: 'batch' })} disabled={waiting === 0 && guarded === 0} title="把同一段话回给多个未读会话">
               <Icon name="batch" size={16} /> 批量回复{waiting > 0 ? `（${waiting}）` : ''}
             </button>
@@ -335,6 +348,7 @@ export function Workspace(props: WorkspaceProps): JSX.Element {
             {shown.map((d) => (
               <DialogRow
                 key={d.key}
+                hub={hub}
                 d={d}
                 accountLabel={accountMap.get(d.accountId)?.label ?? null}
                 accountColor={accountMap.get(d.accountId)?.color ?? null}
@@ -384,6 +398,19 @@ export function Workspace(props: WorkspaceProps): JSX.Element {
       ) : null}
       {modal.kind === 'quick' ? <QuickRepliesModal vault={vault} onChanged={rerender} onClose={() => setModal({ kind: 'none' })} /> : null}
       {modal.kind === 'batch' ? <BatchModal hub={hub} accountId={filter} quickReplies={vault.data.quickReplies} onClose={() => setModal({ kind: 'none' })} /> : null}
+      {modal.kind === 'group' ? (
+        <NewGroupModal
+          hub={hub}
+          accounts={accounts}
+          defaultAccountId={filter}
+          onClose={() => setModal({ kind: 'none' })}
+          onCreated={(key, notAdded) => {
+            setModal({ kind: 'none' });
+            setNotice(notAdded > 0 ? `群已建好。有 ${notAdded} 个人因为对方的隐私设置没能拉进来，可以在「群管理」里把邀请链接发给他们。` : null);
+            open(key);
+          }}
+        />
+      ) : null}
       {modal.kind === 'settings' ? <SettingsModal vault={vault} hub={hub} onChanged={rerender} onClose={() => setModal({ kind: 'none' })} onWipe={props.onWipe} /> : null}
     </div>
   );

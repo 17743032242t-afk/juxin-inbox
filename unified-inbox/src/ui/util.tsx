@@ -125,7 +125,12 @@ type IconName =
   | 'users'
   | 'mute'
   | 'popout'
-  | 'smile';
+  | 'smile'
+  | 'download'
+  | 'play'
+  | 'forward'
+  | 'file'
+  | 'group-add';
 
 const PATHS: Record<IconName, string> = {
   lock: 'M7 10V7a5 5 0 0 1 10 0v3M6 10h12a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1v-8a1 1 0 0 1 1-1z',
@@ -152,6 +157,11 @@ const PATHS: Record<IconName, string> = {
   mute: 'M4 9v6h4l5 4V5L8 9zM17 9l4 6M21 9l-4 6',
   popout: 'M14 4h6v6M20 4l-8 8M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5',
   smile: 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM8.5 14a4.5 4.5 0 0 0 7 0M9 9.5v1M15 9.5v1',
+  download: 'M12 4v11M7 11l5 5 5-5M5 20h14',
+  play: 'M8 5l11 7-11 7z',
+  forward: 'M14 8l5 4-5 4M19 12h-9a5 5 0 0 0-5 5v1',
+  file: 'M7 3h7l5 5v12a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1zM14 3v5h5',
+  'group-add': 'M9 11a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM2.5 20a6.5 6.5 0 0 1 13 0M19 8v6M16 11h6',
 };
 
 export function Icon(props: { name: IconName; size?: number }): JSX.Element {

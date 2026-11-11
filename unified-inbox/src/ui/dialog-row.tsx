@@ -1,7 +1,8 @@
 import type { JSX } from 'preact';
 import { memo } from 'preact/compat';
-import type { InboxDialog } from '../core/hub.ts';
-import { AccountChip, Avatar, Icon, listTime } from './util.tsx';
+import type { Hub, InboxDialog } from '../core/hub.ts';
+import { ChatAvatar } from './media.tsx';
+import { AccountChip, Icon, listTime } from './util.tsx';
 
 function preview(d: InboxDialog): string {
   const m = d.last;
@@ -13,6 +14,7 @@ function preview(d: InboxDialog): string {
 }
 
 export interface DialogRowProps {
+  hub: Hub;
   d: InboxDialog;
   accountLabel: string | null;
   accountColor: string | null;
@@ -39,7 +41,7 @@ export const DialogRow = memo(function DialogRow(props: DialogRowProps): JSX.Ele
         title={props.onPopout ? '单击打开，双击在独立窗口打开' : undefined}
         style={{ '--acct': props.accountColor ?? 'transparent' }}
       >
-        <Avatar title={d.title} badgeColor={props.accountColor ?? undefined} />
+        <ChatAvatar hub={props.hub} chatKey={d.key} title={d.title} hasAvatar={d.hasAvatar} badgeColor={props.accountColor ?? undefined} />
         <span class="dialog-main">
           <span class="dialog-top">
             <span class="dialog-title">{d.title}</span>
