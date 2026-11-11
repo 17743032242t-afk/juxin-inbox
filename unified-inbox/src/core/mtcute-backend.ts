@@ -231,6 +231,7 @@ export class MtcuteBackend implements AccountBackend {
     if (media && media.type !== 'webpage') {
       label = MEDIA_LABELS[media.type] ?? '[暂不支持显示的内容]';
       if (media.type === 'document' && media.fileName) label = `[文件] ${media.fileName}`;
+      if (media.type === 'sticker' && media.emoji) label = `[贴纸 ${media.emoji}]`;
     }
     const isGroup = msg.chat.type === 'chat' && msg.chat.chatType !== 'channel';
     const reply = msg.replyToMessage;

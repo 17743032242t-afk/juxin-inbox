@@ -47,6 +47,7 @@ export class MockNetwork {
   /** 每次操作的模拟延迟（毫秒） */
   latency = 0;
   sent: { userId: number; chatId: number; text: string }[] = [];
+  files: { userId: number; chatId: number; name: string; bytes: number; asPhoto: boolean }[] = [];
   now: () => number = () => Date.now();
   /** 正在等人扫码的登录；scanQr 会让最早的那个扫码成功 */
   qrWaiters: ((phone: string) => void)[] = [];
@@ -334,14 +335,19 @@ export class MockBackend implements AccountBackend {
   }
 
   async sendFile(chatId: number, file: OutgoingFile, caption: string, opts?: SendOptions): Promise<MessageInfo> {
-    const msg = await this.sendText(chatId, caption || ' ', opts);
+    await this.tick();
+    const u = this.requireUser();
     const chat = this.chat(chatId);
-    const stored = chat.messages.find((m) => m.id === msg.id)!;
-    stored.text = caption;
-    stored.media = file.asPhoto ? '[图片]' : `[文件] ${file.name}`;
-    stored.hasPhoto = file.asPhoto;
-    if (file.asPhoto) chat.photos.add(stored.id);
-    return { ...stored };
+    if (!chat.info.canSend) throw new AppError('forbidden', '没有权限在这个会话里发言。');
+    if (this.net.floodChats.has(chatId)) throw new AppError('flood', '操作太频繁，官方要求等待 30 秒 后再试。', 30);
+    // 文件可以不带说明文字
+    const msg = this.net.seed(u.self.userId, chatId, caption, { out: true, photo: file.asPhoto });
+    if (!file.asPhoto) msg.media = `[文件] ${file.name}`;
+    if (opts?.replyToId) msg.replyTo = { id: opts.replyToId, quote: '' };
+    chat.info.readOutboxMaxId = msg.id - 1;
+    this.net.sent.push({ userId: u.self.userId, chatId, text: caption });
+    this.net.files.push({ userId: u.self.userId, chatId, name: file.name, bytes: file.data.byteLength, asPhoto: file.asPhoto });
+    return { ...msg };
   }
 
   async editText(chatId: number, messageId: number, text: string): Promise<MessageInfo> {

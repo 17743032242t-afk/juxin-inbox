@@ -101,6 +101,9 @@ export class Hub {
   private messageMap = new Map<string, MessageInfo[]>();
   private historyMap = new Map<string, HistoryState>();
   private listeners = new Set<() => void>();
+  private keyListeners = new Map<string, Set<() => void>>();
+  private pendingKeys = new Set<string>();
+  private pendingAllKeys = false;
   private notifyQueued = false;
   private destroyed = false;
   private sortedCache: InboxDialog[] | null = null;
@@ -114,6 +117,8 @@ export class Hub {
   /** 当前时间（测试时可以替换） */
   now: () => number = () => Date.now();
   private sendLog = new Map<string, number[]>();
+  /** 独立窗口里正在显示的会话：窗口编号 → 会话和「这个窗口现在是否正被人看着」 */
+  private viewers = new Map<string, { key: string; watching: () => boolean }>();
 
   constructor(vault: Vault, factory: BackendFactory) {
     this.vault = vault;
@@ -130,14 +135,44 @@ export class Hub {
     return () => this.listeners.delete(fn);
   }
 
-  private changed(): void {
+  /** 只关心某一个会话的订阅（独立窗口用）：别的会话来消息时不会被打扰 */
+  subscribeKey(key: string, fn: () => void): () => void {
+    let set = this.keyListeners.get(key);
+    if (!set) {
+      set = new Set();
+      this.keyListeners.set(key, set);
+    }
+    set.add(fn);
+    return () => {
+      set.delete(fn);
+      if (set.size === 0 && this.keyListeners.get(key) === set) this.keyListeners.delete(key);
+    };
+  }
+
+  /**
+   * 通知界面刷新。传了 key 表示「只有这一个会话变了」，
+   * 这样开着很多独立窗口时，只有相关的那个窗口需要重画，其余窗口不动。
+   * 不传 key 表示账号级或全局的变化，所有窗口都刷新。
+   */
+  private changed(key?: string): void {
     this.sortedCache = null;
     this.version++;
+    if (key === undefined) this.pendingAllKeys = true;
+    else this.pendingKeys.add(key);
     if (this.notifyQueued) return;
     this.notifyQueued = true;
     queueMicrotask(() => {
       this.notifyQueued = false;
+      const all = this.pendingAllKeys;
+      const keys = this.pendingKeys;
+      this.pendingAllKeys = false;
+      this.pendingKeys = new Set();
       for (const fn of [...this.listeners]) fn();
+      if (all) {
+        for (const set of [...this.keyListeners.values()]) for (const fn of [...set]) fn();
+      } else {
+        for (const k of keys) for (const fn of [...(this.keyListeners.get(k) ?? [])]) fn();
+      }
     });
   }
 
@@ -314,7 +349,7 @@ export class Hub {
         if (list && i >= 0) list[i] = msg;
         const d = this.dialogMap.get(key);
         if (d?.last?.id === msg.id) this.dialogMap.set(key, { ...d, last: msg });
-        this.changed();
+        this.changed(key);
       },
       onDelete: (chatId, ids) => {
         if (live()) this.handleDelete(accountId, chatId, ids);
@@ -329,7 +364,7 @@ export class Hub {
         } else {
           this.dialogMap.set(key, { ...d, unread: unread ?? 0 });
         }
-        this.changed();
+        this.changed(key);
       },
       onStatus: (status, detail) => {
         if (!live()) return;
@@ -346,7 +381,7 @@ export class Hub {
   private handleMessage(accountId: string, msg: MessageInfo, chat: { title: string; kind: ChatKind; canSend: boolean }): void {
     const key = dialogKey(accountId, msg.chatId);
     const existing = this.dialogMap.get(key);
-    const reading = this.activeKey === key && this.isVisible();
+    const reading = this.isBeingRead(key);
     const countsAsUnread = !msg.out && chat.kind !== 'self' && !reading;
     const base: InboxDialog = existing ?? {
       key,
@@ -370,7 +405,7 @@ export class Hub {
     };
     this.dialogMap.set(key, dialog);
     this.insertMessages(key, [msg]);
-    this.changed();
+    this.changed(key);
     // 正在看的会话来了新消息：本地不计未读，但仍要告诉服务器「已读」，否则下次打开又变回未读
     if (!msg.out && reading) void this.markRead(key, true);
     if (countsAsUnread && !dialog.muted) {
@@ -402,7 +437,7 @@ export class Hub {
     for (const m of incoming) byId.set(m.id, m);
     let list = [...byId.values()].sort((a, b) => a.id - b.id);
     // 只在「正在看最新消息」时才裁掉太旧的，避免翻历史时被截断
-    if (list.length > MESSAGE_CAP && this.activeKey !== key) list = list.slice(-MESSAGE_CAP);
+    if (list.length > MESSAGE_CAP && !this.isOpen(key)) list = list.slice(-MESSAGE_CAP);
     this.messageMap.set(key, list);
   }
 
@@ -416,6 +451,41 @@ export class Hub {
       throw new AppError('revoked', `账号「${rt?.stored.label ?? '?'}」的登录已失效，请重新登录后再试。`);
     }
     return { backend: rt.backend, dialog };
+  }
+
+  /** 这个会话是否在主窗口或任何独立窗口里开着 */
+  isOpen(key: string): boolean {
+    if (this.activeKey === key) return true;
+    for (const v of this.viewers.values()) if (v.key === key) return true;
+    return false;
+  }
+
+  /** 这个会话现在是否真的有人在看（开着，而且那个窗口在前台） */
+  isBeingRead(key: string): boolean {
+    if (this.activeKey === key && this.isVisible()) return true;
+    for (const v of this.viewers.values()) if (v.key === key && v.watching()) return true;
+    return false;
+  }
+
+  /** 哪些会话开在独立窗口里（主窗口用来标记） */
+  poppedOutKeys(): Set<string> {
+    return new Set([...this.viewers.values()].map((v) => v.key));
+  }
+
+  /**
+   * 独立窗口开始显示一个会话。同一个窗口再次调用就是换了会话。
+   * watching 返回 true 时，来的新消息才算「已读」。
+   */
+  async attachViewer(viewerId: string, key: string, watching: () => boolean): Promise<void> {
+    this.viewers.set(viewerId, { key, watching });
+    this.changed(key);
+    const state = this.history(key);
+    if (!state.loaded && !state.loading) await this.loadHistory(key, false);
+    if (this.viewers.get(viewerId)?.key === key && watching()) await this.markRead(key);
+  }
+
+  detachViewer(viewerId: string): void {
+    if (this.viewers.delete(viewerId)) this.changed();
   }
 
   async openChat(key: string | null): Promise<void> {
@@ -436,7 +506,7 @@ export class Hub {
   private async loadHistory(key: string, older: boolean): Promise<void> {
     const prev = this.history(key);
     this.historyMap.set(key, { ...prev, loading: true, error: null });
-    this.changed();
+    this.changed(key);
     try {
       const { backend, dialog } = this.backendFor(key);
       const oldest = older ? this.messages(key)[0] : undefined;
@@ -447,7 +517,7 @@ export class Hub {
     } catch (e) {
       this.historyMap.set(key, { ...prev, loading: false, error: errorText(e) });
     }
-    this.changed();
+    this.changed(key);
   }
 
   async markRead(key: string, force = false): Promise<void> {
@@ -455,7 +525,7 @@ export class Hub {
     if (!d || (d.unread === 0 && !force)) return;
     if (d.unread !== 0) {
       this.dialogMap.set(key, { ...d, unread: 0 });
-      this.changed();
+      this.changed(key);
     }
     try {
       await this.backendFor(key).backend.markRead(d.chatId);
@@ -468,7 +538,7 @@ export class Hub {
     const d = this.dialogMap.get(key);
     if (d) this.dialogMap.set(key, { ...d, last: msg, unread: 0 });
     this.insertMessages(key, [msg]);
-    this.changed();
+    this.changed(key);
   }
 
   /** 从「收到消息的那个账号」发出回复 */
@@ -502,7 +572,7 @@ export class Hub {
     if (list && i >= 0) list[i] = msg;
     const d = this.dialogMap.get(key);
     if (d?.last?.id === messageId) this.dialogMap.set(key, { ...d, last: msg });
-    this.changed();
+    this.changed(key);
   }
 
   async remove(key: string, messageId: number): Promise<void> {
@@ -512,7 +582,7 @@ export class Hub {
     this.messageMap.set(key, kept);
     const d = this.dialogMap.get(key);
     if (d?.last?.id === messageId) this.dialogMap.set(key, { ...d, last: kept.at(-1) ?? null });
-    this.changed();
+    this.changed(key);
   }
 
   async loadPhoto(key: string, messageId: number, size: 'thumb' | 'full'): Promise<Uint8Array | null> {
@@ -620,6 +690,7 @@ export class Hub {
       this.historyMap.delete(key);
     }
     if (this.activeKey?.startsWith(prefix)) this.activeKey = null;
+    for (const [viewerId, v] of [...this.viewers]) if (v.key.startsWith(prefix)) this.viewers.delete(viewerId);
     this.changed();
     return { loggedOut };
   }
@@ -633,6 +704,7 @@ export class Hub {
   async destroy(): Promise<void> {
     this.destroyed = true;
     this.listeners.clear();
+    this.keyListeners.clear();
     this.onIncoming = null;
     const backends = [...this.runtimes.values()].map((rt) => rt.backend);
     this.runtimes.clear();
@@ -641,6 +713,7 @@ export class Hub {
     this.historyMap.clear();
     this.sortedCache = null;
     this.activeKey = null;
+    this.viewers.clear();
     await Promise.all(backends.map((b) => b?.destroy()));
   }
 }
