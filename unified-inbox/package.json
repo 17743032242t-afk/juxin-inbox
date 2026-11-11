@@ -21,7 +21,8 @@
     "demo": "node build.mjs --demo && node scripts/serve.mjs dist-demo 4174",
     "typecheck": "tsc -p .",
     "test": "node --test \"test/*.test.ts\"",
-    "test:e2e": "node test/e2e.cjs"
+    "test:e2e": "node test/e2e.cjs && node test/e2e-popout.cjs",
+    "bench": "node test/bench-windows.cjs"
   },
   "engines": {
     "node": ">=22.18"

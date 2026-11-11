@@ -42,7 +42,7 @@ npm run build
 
 预期结果：
 
-- `npm test` 输出 `# fail 0`（当前版本是 `# pass 56`；以后版本的通过数只会增加）。有任何失败就停下来回报，不要部署。
+- `npm test` 输出 `# fail 0`（当前版本是 `# pass 62`；以后版本的通过数只会增加）。有任何失败就停下来回报，不要部署。
 - `npm run build` 生成 `dist/`，里面是 13 个文件：`index.html`、`app.js`、`app.css`、两个 `chunk-*.js`、`mtcute.wasm`、`mtcute-simd.wasm`、`sw.js`、`manifest.webmanifest`、`icon.svg`、三个 `icon-*.png`，外加一份 `SHA256SUMS.txt`。
 
 **必须从源码打包，不要用任何人发来的现成 `dist/`。**
