@@ -148,7 +148,8 @@ async function main() {
   // 6. 打开会话、回复；消息从正确的账号发出
   await page.click('.dialog:has(.chip:text("客户号")):has-text("测试联系人甲")');
   await page.waitForSelector('.msg.in');
-  assert.match(await page.textContent('.chat-head .via'), /客户号/);
+  // 标题栏写明这条会话走的是哪个账号：备注名、这个号的名字、手机尾号
+  assert.match(await page.textContent('.chat-head .via'), /通过\s*客户号\s*收发.*尾号 0011/s);
   assert.match(await page.getAttribute('.composer textarea', 'placeholder'), /以「客户号」回复 测试联系人甲/);
   await page.fill('.composer textarea', '在的，您请说');
   await page.keyboard.press('Enter');

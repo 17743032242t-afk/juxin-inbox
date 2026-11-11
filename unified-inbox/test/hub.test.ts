@@ -483,3 +483,144 @@ test('发文件：可以不带说明文字；从收到消息的账号发出；�
   for (let i = 2; i < SEND_LIMIT_PER_MINUTE; i++) await hub.send(key, `第${i}条`);
   await assert.rejects(hub.sendFile(key, { name: 'b.txt', type: '', data, asPhoto: false }, ''), (e: unknown) => e instanceof AppError && e.code === 'flood');
 });
+
+// —— 下载、头像、转发、贴纸、建群 ——
+
+test('下载收到的文件：拿到内容、文件名和类型，并能看到进度', async () => {
+  const { hub, net, a, ua } = await twoAccounts();
+  const key = dialogKey(a, 101);
+  net.seed(ua, 101, '', { file: { name: '合同.pdf', mime: 'application/pdf', size: 2048 } });
+  await hub.openChat(key);
+  const msg = hub.messages(key).at(-1)!;
+  assert.deepEqual([msg.attachment?.kind, msg.attachment?.name, msg.media], ['file', '合同.pdf', '[文件] 合同.pdf']);
+  const progress: number[] = [];
+  const file = await hub.loadAttachment(key, msg.id, (done, total) => progress.push(done / total));
+  assert.equal(file?.name, '合同.pdf');
+  assert.equal(file?.mime, 'application/pdf');
+  assert.ok((file?.data.byteLength ?? 0) > 0);
+  assert.deepEqual(progress, [0.5, 1]);
+  // 没有附件的消息返回空
+  assert.equal(await hub.loadAttachment(key, hub.messages(key)[0]!.id), null);
+});
+
+test('超过 200MB 的文件不在软件里下载，给出明确提示', async () => {
+  const { hub, net, a, ua } = await twoAccounts();
+  const key = dialogKey(a, 101);
+  net.seed(ua, 101, '', { file: { name: '大视频.mp4', kind: 'video', mime: 'video/mp4', size: 300 * 1024 * 1024 } });
+  await hub.openChat(key);
+  await assert.rejects(hub.loadAttachment(key, hub.messages(key).at(-1)!.id), /200MB/);
+});
+
+test('头像：有头像的会话才去取，同一个会话只取一次', async () => {
+  const { hub, net, a, ua } = await twoAccounts();
+  net.addChat(ua, 500, '有头像的人', 'user', { hasAvatar: true });
+  await hub.refreshDialogs(a);
+  net.avatarLoads = 0;
+  assert.equal(await hub.loadAvatar(dialogKey(a, 101)), null); // 没设头像
+  assert.equal(net.avatarLoads, 0);
+  const first = await hub.loadAvatar(dialogKey(a, 500));
+  const again = await hub.loadAvatar(dialogKey(a, 500));
+  assert.ok(first && first.byteLength > 0);
+  assert.equal(again, first);
+  assert.equal(net.avatarLoads, 1);
+});
+
+test('转发：在同一个账号内把多条消息转到另一个会话，内容和附件都带上', async () => {
+  const { hub, net, a, ua } = await twoAccounts();
+  const from = dialogKey(a, 101);
+  const to = dialogKey(a, 102);
+  net.seed(ua, 101, '报价单见附件', { file: { name: '报价.xlsx' } });
+  await hub.openChat(from);
+  const ids = hub.messages(from).map((m) => m.id);
+  const n = await hub.forward(from, ids, to);
+  assert.equal(n, 2);
+  assert.deepEqual(net.forwards, [{ userId: ua, from: 101, to: 102, ids }]);
+  const last = hub.dialog(to)?.last;
+  assert.equal(last?.text, '报价单见附件');
+  assert.equal(last?.attachment?.name, '报价.xlsx');
+  assert.equal(last?.out, true);
+});
+
+test('转发：不能跨账号；不能转到没有发言权限的会话；对方禁止转发时给出提示；有数量上限', async () => {
+  const { hub, net, a, b } = await twoAccounts();
+  const from = dialogKey(a, 101);
+  await hub.openChat(from);
+  const id = hub.messages(from)[0]!.id;
+  await assert.rejects(hub.forward(from, [id], dialogKey(b, 101)), /同一个账号/);
+  await assert.rejects(hub.forward(dialogKey(b, 101), [1], dialogKey(b, -1000000000555)), (e: unknown) => e instanceof AppError && e.code === 'forbidden');
+  net.protectedChats.add(101);
+  await assert.rejects(hub.forward(from, [id], dialogKey(a, 102)), /禁止转发/);
+  await assert.rejects(hub.forward(from, Array.from({ length: 31 }, (_, i) => i + 1), dialogKey(a, 102)), /最多转发 30 条/);
+  await assert.rejects(hub.forward(from, [], dialogKey(a, 102)), AppError);
+  assert.equal(net.forwards.length, 0);
+});
+
+test('多选删除：只删自己发的，别人发的会被跳过', async () => {
+  const { hub, a } = await twoAccounts();
+  const key = dialogKey(a, 101);
+  await hub.openChat(key);
+  const theirs = hub.messages(key)[0]!.id;
+  const m1 = await hub.send(key, '第一条');
+  const m2 = await hub.send(key, '第二条');
+  assert.equal(await hub.removeMany(key, [theirs, m1.id, m2.id]), 2);
+  assert.deepEqual(hub.messages(key).map((m) => m.id), [theirs]);
+  assert.equal(hub.dialog(key)?.last?.id, theirs);
+});
+
+test('贴纸：列出这个账号的贴纸包和贴纸，发出去后显示为贴纸消息', async () => {
+  const { hub, net, a, ua } = await twoAccounts();
+  const sets = await hub.listStickerSets(a);
+  assert.deepEqual(sets.map((s) => [s.title, s.count]), [['生意常用', 3], ['日常', 2]]);
+  const stickers = await hub.listStickers(a, sets[0]!.id);
+  assert.equal(stickers.length, 3);
+  assert.ok((await hub.loadStickerImage(a, stickers[0]!.id))?.data.byteLength);
+  const key = dialogKey(a, 101);
+  const msg = await hub.sendSticker(key, stickers[0]!.id);
+  assert.deepEqual(msg.attachment?.sticker, { emoji: '👌', format: 'static' });
+  assert.deepEqual(net.sent.at(-1), { userId: ua, chatId: 101, text: '[贴纸:biz-ok]' });
+  assert.equal(hub.dialog(key)?.last?.id, msg.id);
+  // 收到的贴纸可以取到图片
+  assert.ok((await hub.loadAttachment(key, msg.id))?.data.byteLength);
+});
+
+test('建群：选联系人建群，新群出现在列表里；被拉的人不允许时会告知人数', async () => {
+  const { hub, net, a, ua } = await twoAccounts();
+  advance(hub, 25 * HOUR);
+  net.noInvite.add(102);
+  const { key, notAdded } = await hub.createGroup(a, '  华东客户群  ', [dialogKey(a, 101), dialogKey(a, 102)]);
+  assert.equal(notAdded, 1);
+  const d = hub.dialog(key);
+  assert.deepEqual([d?.title, d?.kind, d?.canManage, d?.accountId], ['华东客户群', 'group', true, a]);
+  assert.equal(hub.dialogs()[0]?.key, key); // 排在最前
+  assert.deepEqual(net.groupLog, [{ userId: ua, action: 'create', chatId: d!.chatId, members: [101, 102] }]);
+  assert.deepEqual(await hub.groupInfo(key), { members: 2 });
+  // 改名、邀请链接、发消息
+  await hub.renameGroup(key, '华东 VIP 群');
+  assert.equal(hub.dialog(key)?.title, '华东 VIP 群');
+  assert.match(await hub.inviteLink(key), /^https:\/\/t\.me\/\+/);
+  await hub.send(key, '大家好');
+  // 退群后从列表消失
+  await hub.leaveGroup(key);
+  assert.equal(hub.dialog(key), null);
+});
+
+test('建群和拉人的保护：刚登录不满 24 小时不行；一次最多 10 人；只能拉本账号的联系人', async () => {
+  const { hub, net, a, b, ua } = await twoAccounts();
+  await assert.rejects(hub.createGroup(a, '新群', [dialogKey(a, 101)]), /24 小时内不能建群/);
+  advance(hub, 25 * HOUR);
+  for (let i = 0; i < 12; i++) net.addChat(ua, 600 + i, `联系人${i}`);
+  net.addChat(ua, 700, '已有的群', 'group');
+  await hub.refreshDialogs(a);
+  const many = Array.from({ length: 11 }, (_, i) => dialogKey(a, 600 + i));
+  await assert.rejects(hub.createGroup(a, '大群', many), /最多选 10 个人/);
+  await assert.rejects(hub.createGroup(a, '串号群', [dialogKey(b, 101)]), /已有私聊的联系人/);
+  await assert.rejects(hub.createGroup(a, '群拉群', [dialogKey(a, 700)]), /已有私聊的联系人/);
+  await assert.rejects(hub.createGroup(a, '   ', [dialogKey(a, 101)]), /群名/);
+  await assert.rejects(hub.createGroup(a, '空群', []), /至少要选一个人/);
+  assert.equal(net.groupLog.length, 0);
+  // 往已有的群里加人同样受限
+  assert.deepEqual(await hub.addMembers(dialogKey(a, 700), [dialogKey(a, 600), dialogKey(a, 601)]), { notAdded: 0 });
+  await assert.rejects(hub.addMembers(dialogKey(a, 700), many), /最多选 10 个人/);
+  await assert.rejects(hub.addMembers(dialogKey(a, 101), [dialogKey(a, 600)]), /只有群才能加人/);
+  assert.deepEqual(net.groupLog.map((g) => g.action), ['add']);
+});
