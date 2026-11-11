@@ -6,11 +6,17 @@
  */
 import {
   AppError,
+  MAX_FORWARD,
+  MAX_GROUP_ADD,
   errorText,
+  type ChatBrief,
+  type GroupInfo,
+  type LoadedFile,
+  type StickerInfo,
+  type StickerSetInfo,
   type AccountBackend,
   type AccountStatus,
   type BackendFactory,
-  type ChatKind,
   type DialogInfo,
   type MessageInfo,
   type OutgoingFile,
@@ -117,6 +123,7 @@ export class Hub {
   /** 当前时间（测试时可以替换） */
   now: () => number = () => Date.now();
   private sendLog = new Map<string, number[]>();
+  private avatarCache = new Map<string, Promise<Uint8Array | null>>();
   /** 独立窗口里正在显示的会话：窗口编号 → 会话和「这个窗口现在是否正被人看着」 */
   private viewers = new Map<string, { key: string; watching: () => boolean }>();
 
@@ -378,7 +385,7 @@ export class Hub {
     });
   }
 
-  private handleMessage(accountId: string, msg: MessageInfo, chat: { title: string; kind: ChatKind; canSend: boolean }): void {
+  private handleMessage(accountId: string, msg: MessageInfo, chat: ChatBrief): void {
     const key = dialogKey(accountId, msg.chatId);
     const existing = this.dialogMap.get(key);
     const reading = this.isBeingRead(key);
@@ -395,6 +402,8 @@ export class Hub {
       readOutboxMaxId: 0,
       last: null,
       canSend: chat.canSend,
+      hasAvatar: chat.hasAvatar,
+      canManage: chat.canManage,
     };
     const isNewer = !base.last || msg.date >= base.last.date;
     const dialog: InboxDialog = {
@@ -576,13 +585,189 @@ export class Hub {
   }
 
   async remove(key: string, messageId: number): Promise<void> {
+    await this.removeMany(key, [messageId]);
+  }
+
+  /** 删除多条（只会删自己发出的；别人发的会被跳过） */
+  async removeMany(key: string, messageIds: number[]): Promise<number> {
     const { backend, dialog } = this.backendFor(key);
-    await backend.deleteMessages(dialog.chatId, [messageId]);
-    const kept = this.messages(key).filter((m) => m.id !== messageId);
+    const mine = new Set(this.messages(key).filter((m) => m.out && messageIds.includes(m.id)).map((m) => m.id));
+    if (mine.size === 0) return 0;
+    await backend.deleteMessages(dialog.chatId, [...mine]);
+    const kept = this.messages(key).filter((m) => !mine.has(m.id));
     this.messageMap.set(key, kept);
     const d = this.dialogMap.get(key);
-    if (d?.last?.id === messageId) this.dialogMap.set(key, { ...d, last: kept.at(-1) ?? null });
+    if (d?.last && mine.has(d.last.id)) this.dialogMap.set(key, { ...d, last: kept.at(-1) ?? null });
     this.changed(key);
+    return mine.size;
+  }
+
+  /**
+   * 转发：只能在同一个账号内转发（消息是「这个账号」看到的，别的账号没有权限读它）。
+   * 一次最多 MAX_FORWARD 条，计入发送限速。
+   */
+  async forward(fromKey: string, messageIds: number[], toKey: string): Promise<number> {
+    const ids = [...new Set(messageIds)];
+    if (ids.length === 0) throw new AppError('invalid', '请先选择要转发的消息。');
+    if (ids.length > MAX_FORWARD) throw new AppError('invalid', `一次最多转发 ${MAX_FORWARD} 条。`);
+    const { backend, dialog: from } = this.backendFor(fromKey);
+    const { dialog: to } = this.backendFor(toKey);
+    if (from.accountId !== to.accountId) {
+      throw new AppError('invalid', '只能转发到同一个账号的会话里。要发给别的账号的联系人，请复制内容或重新发送文件。');
+    }
+    if (!to.canSend) throw new AppError('forbidden', '没有权限在这个会话里发言。');
+    this.checkSendRate(to.accountId);
+    const sent = await backend.forward(from.chatId, ids, to.chatId);
+    const last = sent.at(-1);
+    if (last) {
+      const d = this.dialogMap.get(toKey);
+      if (d) this.dialogMap.set(toKey, { ...d, last, unread: 0 });
+      this.insertMessages(toKey, sent);
+    }
+    this.changed(toKey);
+    return sent.length;
+  }
+
+  loadAttachment(key: string, messageId: number, onProgress?: (done: number, total: number) => void): Promise<LoadedFile | null> {
+    const { backend, dialog } = this.backendFor(key);
+    return backend.loadAttachment(dialog.chatId, messageId, onProgress);
+  }
+
+  loadAttachmentPreview(key: string, messageId: number): Promise<LoadedFile | null> {
+    const { backend, dialog } = this.backendFor(key);
+    return backend.loadAttachmentPreview(dialog.chatId, messageId);
+  }
+
+  /** 头像。同一个会话只向服务器要一次，之后用缓存；没有头像或取不到时返回 null。 */
+  loadAvatar(key: string): Promise<Uint8Array | null> {
+    let p = this.avatarCache.get(key);
+    if (!p) {
+      const d = this.dialogMap.get(key);
+      if (!d?.hasAvatar) return Promise.resolve(null);
+      p = Promise.resolve()
+        .then(() => this.backendFor(key).backend.loadAvatar(d.chatId))
+        .catch(() => {
+          // 失败不缓存，下次还可以再试
+          this.avatarCache.delete(key);
+          return null;
+        });
+      this.avatarCache.set(key, p);
+    }
+    return p;
+  }
+
+  // —— 贴纸 ——
+
+  private backendOf(accountId: string): AccountBackend {
+    const rt = this.runtimes.get(accountId);
+    if (!rt?.backend || rt.status === 'revoked') {
+      throw new AppError('revoked', `账号「${rt?.stored.label ?? '?'}」的登录已失效，请重新登录后再试。`);
+    }
+    return rt.backend;
+  }
+
+  /** 这个账号已添加的贴纸包（每个账号的贴纸包各不相同） */
+  listStickerSets(accountId: string): Promise<StickerSetInfo[]> {
+    return this.backendOf(accountId).listStickerSets();
+  }
+
+  listStickers(accountId: string, setId: string): Promise<StickerInfo[]> {
+    return this.backendOf(accountId).listStickers(setId);
+  }
+
+  loadStickerImage(accountId: string, stickerId: string): Promise<LoadedFile | null> {
+    return this.backendOf(accountId).loadStickerImage(stickerId);
+  }
+
+  async sendSticker(key: string, stickerId: string, opts?: SendOptions): Promise<MessageInfo> {
+    const { backend, dialog } = this.backendFor(key);
+    if (!dialog.canSend) throw new AppError('forbidden', '没有权限在这个会话里发言。');
+    this.checkSendRate(dialog.accountId);
+    const msg = await backend.sendSticker(dialog.chatId, stickerId, opts);
+    this.afterSend(key, msg);
+    return msg;
+  }
+
+  // —— 群 ——
+
+  /**
+   * 建群、拉人是官方重点盯的行为（最像拉人广告），所以比发消息管得更严：
+   * 刚登录不满 24 小时的账号不能做；一次最多选 MAX_GROUP_ADD 个人；只能拉自己已有私聊的联系人。
+   */
+  private groupGuard(accountId: string, memberKeys: string[]): number[] {
+    const rt = this.runtimes.get(accountId);
+    const until = (rt?.stored.loginAt ?? 0) + NEW_LOGIN_PROTECT_MS;
+    if (until > this.now()) {
+      const hours = Math.ceil((until - this.now()) / 3_600_000);
+      throw new AppError('forbidden', `刚登录的账号 24 小时内不能建群和拉人（还剩约 ${hours} 小时）。这是为了避免账号被官方当成拉人广告而限制。`);
+    }
+    const keys = [...new Set(memberKeys)];
+    if (keys.length > MAX_GROUP_ADD) throw new AppError('invalid', `一次最多选 ${MAX_GROUP_ADD} 个人。`);
+    return keys.map((k) => {
+      const d = this.dialogMap.get(k);
+      if (!d || d.accountId !== accountId || d.kind !== 'user') throw new AppError('invalid', '只能选这个账号里已有私聊的联系人。');
+      return d.chatId;
+    });
+  }
+
+  /** 建群，返回新群的会话 key 和没能拉进来的人数 */
+  async createGroup(accountId: string, title: string, memberKeys: string[]): Promise<{ key: string; notAdded: number }> {
+    const name = title.trim();
+    if (!name) throw new AppError('invalid', '请填写群名。');
+    const members = this.groupGuard(accountId, memberKeys);
+    if (members.length === 0) throw new AppError('invalid', '建群至少要选一个人。');
+    const { dialog, notAdded } = await this.backendOf(accountId).createGroup(name, members);
+    const key = dialogKey(accountId, dialog.chatId);
+    this.dialogMap.set(key, { ...dialog, key, accountId, last: dialog.last ?? { ...this.placeholderMessage(dialog.chatId, '群已创建') } });
+    this.changed();
+    return { key, notAdded };
+  }
+
+  /** 让新群在列表里有时间可排（服务器的「创建了群」消息随后会覆盖它） */
+  private placeholderMessage(chatId: number, text: string): MessageInfo {
+    return { id: 0, chatId, date: this.now(), out: true, text: '', media: text, hasPhoto: false, attachment: null, sender: null, service: true, replyTo: null, edited: false };
+  }
+
+  async addMembers(key: string, memberKeys: string[]): Promise<{ notAdded: number }> {
+    const { backend, dialog } = this.backendFor(key);
+    if (dialog.kind !== 'group') throw new AppError('invalid', '只有群才能加人。');
+    const members = this.groupGuard(dialog.accountId, memberKeys);
+    if (members.length === 0) throw new AppError('invalid', '请至少选一个人。');
+    return backend.addMembers(dialog.chatId, members);
+  }
+
+  async renameGroup(key: string, title: string): Promise<void> {
+    const name = title.trim();
+    if (!name) throw new AppError('invalid', '请填写群名。');
+    const { backend, dialog } = this.backendFor(key);
+    await backend.renameGroup(dialog.chatId, name);
+    const d = this.dialogMap.get(key);
+    if (d) this.dialogMap.set(key, { ...d, title: name });
+    this.changed(key);
+  }
+
+  inviteLink(key: string): Promise<string> {
+    const { backend, dialog } = this.backendFor(key);
+    return backend.inviteLink(dialog.chatId);
+  }
+
+  groupInfo(key: string): Promise<GroupInfo> {
+    const { backend, dialog } = this.backendFor(key);
+    return backend.groupInfo(dialog.chatId);
+  }
+
+  /** 退群：退出后这个群从列表里消失 */
+  async leaveGroup(key: string): Promise<void> {
+    const { backend, dialog } = this.backendFor(key);
+    if (dialog.kind !== 'group') throw new AppError('invalid', '只有群才能退出。');
+    await backend.leaveGroup(dialog.chatId);
+    this.dialogMap.delete(key);
+    this.messageMap.delete(key);
+    this.historyMap.delete(key);
+    this.avatarCache.delete(key);
+    if (this.activeKey === key) this.activeKey = null;
+    for (const [viewerId, v] of [...this.viewers]) if (v.key === key) this.viewers.delete(viewerId);
+    this.changed();
   }
 
   async loadPhoto(key: string, messageId: number, size: 'thumb' | 'full'): Promise<Uint8Array | null> {
@@ -688,6 +873,7 @@ export class Hub {
       this.dialogMap.delete(key);
       this.messageMap.delete(key);
       this.historyMap.delete(key);
+      this.avatarCache.delete(key);
     }
     if (this.activeKey?.startsWith(prefix)) this.activeKey = null;
     for (const [viewerId, v] of [...this.viewers]) if (v.key.startsWith(prefix)) this.viewers.delete(viewerId);
@@ -714,6 +900,7 @@ export class Hub {
     this.sortedCache = null;
     this.activeKey = null;
     this.viewers.clear();
+    this.avatarCache.clear();
     await Promise.all(backends.map((b) => b?.destroy()));
   }
 }

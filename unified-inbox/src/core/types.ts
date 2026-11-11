@@ -17,6 +17,52 @@ export interface SelfInfo {
   phone: string | null;
 }
 
+/** 贴纸的三种格式：静态图、动画（矢量）、视频 */
+export type StickerFormat = 'static' | 'animated' | 'video';
+
+/** 消息里可以下载或播放的附件（图片另算，见 hasPhoto） */
+export interface AttachmentInfo {
+  kind: 'file' | 'video' | 'gif' | 'voice' | 'audio' | 'sticker';
+  name: string;
+  mime: string;
+  /** 字节数；未知为 null */
+  size: number | null;
+  /** 时长（秒）；没有为 null */
+  duration: number | null;
+  /** 贴纸的格式和对应的表情 */
+  sticker: { emoji: string; format: StickerFormat } | null;
+}
+
+/** 下载下来的内容 */
+export interface LoadedFile {
+  data: Uint8Array;
+  mime: string;
+  name: string;
+}
+
+export interface StickerSetInfo {
+  id: string;
+  title: string;
+  count: number;
+}
+
+export interface StickerInfo {
+  id: string;
+  emoji: string;
+  format: StickerFormat;
+}
+
+export interface GroupInfo {
+  members: number;
+}
+
+/** 一次最多加几个人进群 / 建群时最多选几个人（保护账号） */
+export const MAX_GROUP_ADD = 10;
+/** 一次最多转发几条 */
+export const MAX_FORWARD = 30;
+/** 能在软件里下载的最大文件（更大的请到官方客户端下载） */
+export const MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024;
+
 export interface MessageInfo {
   id: number;
   chatId: number;
@@ -29,6 +75,8 @@ export interface MessageInfo {
   media: string | null;
   /** 是否有可以显示的图片 */
   hasPhoto: boolean;
+  /** 可以下载或播放的附件 */
+  attachment: AttachmentInfo | null;
   /** 群里的发言人名字（私聊为空） */
   sender: string | null;
   /** 系统消息（入群、置顶等） */
@@ -50,7 +98,14 @@ export interface DialogInfo {
   last: MessageInfo | null;
   /** 我方是否可以在此发言（频道通常不行） */
   canSend: boolean;
+  /** 对方/这个群有没有设置头像 */
+  hasAvatar: boolean;
+  /** 我方是不是这个群的群主或管理员 */
+  canManage: boolean;
 }
+
+/** 来新消息时，连接层顺带告诉上层的会话信息 */
+export type ChatBrief = Pick<DialogInfo, 'title' | 'kind' | 'canSend' | 'hasAvatar' | 'canManage'>;
 
 export interface SentCodeInfo {
   /** 验证码发送方式：app = 发到已登录的官方客户端；sms = 短信；other = 其他 */
@@ -59,7 +114,7 @@ export interface SentCodeInfo {
 }
 
 export interface BackendEvents {
-  onMessage(msg: MessageInfo, chat: { title: string; kind: ChatKind; canSend: boolean }): void;
+  onMessage(msg: MessageInfo, chat: ChatBrief): void;
   onEdit(msg: MessageInfo): void;
   onDelete(chatId: number | null, ids: number[]): void;
   /** inbox：我方在别的设备上读了消息；outbox：对方读了我方消息 */
@@ -124,6 +179,32 @@ export interface AccountBackend {
   markRead(chatId: number): Promise<void>;
   /** 取图片内容；没有图片返回 null */
   loadPhoto(chatId: number, messageId: number, size: 'thumb' | 'full'): Promise<Uint8Array | null>;
+  /** 下载附件（文件、视频、语音、贴纸本体）；没有返回 null */
+  loadAttachment(chatId: number, messageId: number, onProgress?: (done: number, total: number) => void): Promise<LoadedFile | null>;
+  /** 附件的静态预览图（动画贴纸、视频封面）；没有返回 null */
+  loadAttachmentPreview(chatId: number, messageId: number): Promise<LoadedFile | null>;
+  /** 头像小图；没有返回 null */
+  loadAvatar(chatId: number): Promise<Uint8Array | null>;
+  /** 把同一个账号里的消息转发到另一个会话 */
+  forward(fromChatId: number, messageIds: number[], toChatId: number): Promise<MessageInfo[]>;
+
+  // —— 贴纸 ——
+  /** 这个账号已经添加的贴纸包 */
+  listStickerSets(): Promise<StickerSetInfo[]>;
+  listStickers(setId: string): Promise<StickerInfo[]>;
+  /** 贴纸面板里用的小图 */
+  loadStickerImage(stickerId: string): Promise<LoadedFile | null>;
+  sendSticker(chatId: number, stickerId: string, opts?: SendOptions): Promise<MessageInfo>;
+
+  // —— 群 ——
+  /** 建群；members 是要拉进来的人（用私聊会话的编号表示） */
+  createGroup(title: string, members: number[]): Promise<{ dialog: DialogInfo; notAdded: number }>;
+  renameGroup(chatId: number, title: string): Promise<void>;
+  /** 返回没能拉进来的人数（对方设置了不允许被拉群等） */
+  addMembers(chatId: number, members: number[]): Promise<{ notAdded: number }>;
+  inviteLink(chatId: number): Promise<string>;
+  groupInfo(chatId: number): Promise<GroupInfo>;
+  leaveGroup(chatId: number): Promise<void>;
 
   /** 退出登录：让这份凭据在服务器上作废 */
   logOut(): Promise<void>;

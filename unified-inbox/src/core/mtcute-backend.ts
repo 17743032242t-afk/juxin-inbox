@@ -12,19 +12,33 @@ import {
   TelegramClient,
   Thumbnail,
   tl,
+  type Audio,
+  type ChatPhoto,
   type Dialog,
+  type Document,
   type Message,
   type Peer,
   type Photo,
+  type Sticker,
+  type StickerSet,
+  type Video,
+  type Voice,
 } from '@mtcute/web';
 import { describeClient } from './env.ts';
 import {
   AppError,
+  MAX_DOWNLOAD_BYTES,
   type AccountBackend,
   type ApiCredentials,
+  type AttachmentInfo,
   type BackendEvents,
+  type ChatBrief,
   type ChatKind,
   type DialogInfo,
+  type GroupInfo,
+  type LoadedFile,
+  type StickerInfo,
+  type StickerSetInfo,
   type MessageInfo,
   type OutgoingFile,
   type QrLoginHandlers,
@@ -54,6 +68,8 @@ const MEDIA_LABELS: Record<string, string> = {
 };
 
 const PHOTO_CACHE_LIMIT = 400;
+const FILE_CACHE_LIMIT = 1500;
+const STICKER_CACHE_LIMIT = 3000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const TRANSFER_TIMEOUT_MS = 10 * 60_000;
 
@@ -114,6 +130,24 @@ export function translateError(e: unknown): AppError {
         return new AppError('invalid', '内容没有变化。');
       case 'MESSAGE_DELETE_FORBIDDEN':
         return new AppError('forbidden', '没有权限删除这条消息。');
+      case 'CHAT_FORWARDS_RESTRICTED':
+        return new AppError('forbidden', '这个会话禁止转发和保存内容。');
+      case 'USER_PRIVACY_RESTRICTED':
+        return new AppError('forbidden', '对方的隐私设置不允许被拉进群。');
+      case 'USERS_TOO_FEW':
+        return new AppError('invalid', '建群至少要选一个人。');
+      case 'USERS_TOO_MUCH':
+        return new AppError('invalid', '群成员已达上限。');
+      case 'USER_NOT_MUTUAL_CONTACT':
+        return new AppError('forbidden', '对方不是你的双向联系人，无法直接拉进群。');
+      case 'USER_ALREADY_PARTICIPANT':
+        return new AppError('invalid', '对方已经在群里了。');
+      case 'CHAT_TITLE_EMPTY':
+        return new AppError('invalid', '群名不能为空。');
+      case 'STICKERSET_INVALID':
+        return new AppError('invalid', '这个贴纸包已经不存在了。');
+      case 'FILE_REFERENCE_EXPIRED':
+        return new AppError('invalid', '这个文件的下载凭证过期了，请重新打开这个会话后再试。');
       default:
         return new AppError('unknown', `官方服务器拒绝了这次操作（${text}）。`);
     }
@@ -147,6 +181,52 @@ function peerTitle(peer: Peer): string {
   return peer.displayName || '（无名称）';
 }
 
+function peerCanManage(peer: Peer): boolean {
+  return peer.type === 'chat' && (peer.isCreator || peer.isAdmin);
+}
+
+function chatBrief(peer: Peer): ChatBrief {
+  return {
+    title: peerTitle(peer),
+    kind: peerKind(peer),
+    canSend: peerCanSend(peer),
+    hasAvatar: peer.photo !== null,
+    canManage: peerCanManage(peer),
+  };
+}
+
+type FileMedia = Document | Video | Voice | Audio | Sticker;
+
+function describeFile(media: FileMedia): AttachmentInfo {
+  const base = { mime: media.mimeType, size: media.fileSize ?? null, duration: null, sticker: null };
+  switch (media.type) {
+    case 'video':
+      return { ...base, kind: media.isAnimation ? 'gif' : 'video', name: media.fileName ?? '视频.mp4', duration: media.duration };
+    case 'voice':
+      return { ...base, kind: 'voice', name: '语音.ogg', duration: media.duration };
+    case 'audio':
+      return { ...base, kind: 'audio', name: media.fileName ?? (media.title ? `${media.title}.mp3` : '音频.mp3'), duration: media.duration };
+    case 'sticker':
+      return { ...base, kind: 'sticker', name: '贴纸', sticker: { emoji: media.emoji, format: media.sourceType } };
+    default:
+      return { ...base, kind: 'file', name: media.fileName ?? '文件' };
+  }
+}
+
+function isFileMedia(media: Message['media']): media is FileMedia {
+  return media !== null && (media.type === 'document' || media.type === 'video' || media.type === 'voice' || media.type === 'audio' || media.type === 'sticker');
+}
+
+/** 有上限的缓存：超出后丢掉最早放进去的 */
+function remember<K, V>(map: Map<K, V>, key: K, value: V, limit: number): void {
+  map.delete(key);
+  map.set(key, value);
+  if (map.size > limit) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+}
+
 function peerCanSend(peer: Peer): boolean {
   if (peer.type === 'user') return true;
   if (peer.chatType === 'channel') return peer.isCreator || peer.isAdmin;
@@ -158,6 +238,10 @@ export class MtcuteBackend implements AccountBackend {
   private events: BackendEvents | null = null;
   private peers = new Map<number, tl.TypeInputPeer>();
   private photos = new Map<string, Photo>();
+  private files = new Map<string, FileMedia>();
+  private avatars = new Map<number, ChatPhoto>();
+  private stickerSets = new Map<string, StickerSet>();
+  private stickers = new Map<string, Sticker>();
   private pendingPhone: string | null = null;
   private pendingCodeHash: string | null = null;
   private destroyed = false;
@@ -175,11 +259,7 @@ export class MtcuteBackend implements AccountBackend {
 
     this.tg.onNewMessage.add((msg) => {
       this.remember(msg);
-      this.events?.onMessage(this.toMessage(msg), {
-        title: peerTitle(msg.chat),
-        kind: peerKind(msg.chat),
-        canSend: peerCanSend(msg.chat),
-      });
+      this.events?.onMessage(this.toMessage(msg), chatBrief(msg.chat));
     });
     this.tg.onEditMessage.add((msg) => {
       this.remember(msg);
@@ -208,17 +288,17 @@ export class MtcuteBackend implements AccountBackend {
   }
 
   private remember(msg: Message): void {
-    this.peers.set(msg.chat.id, msg.chat.inputPeer);
+    this.rememberPeer(msg.chat);
     const media = msg.media;
-    if (media?.type === 'photo') {
-      const key = `${msg.chat.id}:${msg.id}`;
-      this.photos.delete(key);
-      this.photos.set(key, media);
-      if (this.photos.size > PHOTO_CACHE_LIMIT) {
-        const oldest = this.photos.keys().next().value;
-        if (oldest !== undefined) this.photos.delete(oldest);
-      }
-    }
+    const key = `${msg.chat.id}:${msg.id}`;
+    if (media?.type === 'photo') remember(this.photos, key, media, PHOTO_CACHE_LIMIT);
+    else if (isFileMedia(media)) remember(this.files, key, media, FILE_CACHE_LIMIT);
+  }
+
+  private rememberPeer(peer: Peer): void {
+    this.peers.set(peer.id, peer.inputPeer);
+    if (peer.photo) this.avatars.set(peer.id, peer.photo);
+    else this.avatars.delete(peer.id);
   }
 
   private peer(chatId: number): tl.TypeInputPeer | number {
@@ -243,6 +323,7 @@ export class MtcuteBackend implements AccountBackend {
       text: msg.isService ? '' : msg.text,
       media: msg.isService ? '[系统消息]' : label,
       hasPhoto: media?.type === 'photo',
+      attachment: !msg.isService && isFileMedia(media) ? describeFile(media) : null,
       sender: isGroup && !msg.isOutgoing ? msg.sender.displayName || null : null,
       service: msg.isService,
       replyTo: reply && reply.id !== null && !reply.isForumTopic ? { id: reply.id, quote: reply.quoteText } : null,
@@ -252,19 +333,17 @@ export class MtcuteBackend implements AccountBackend {
 
   private toDialog(d: Dialog): DialogInfo {
     const peer = d.peer;
-    this.peers.set(peer.id, peer.inputPeer);
+    this.rememberPeer(peer);
     const last = d.lastMessage;
     if (last) this.remember(last);
     return {
       chatId: peer.id,
-      title: peerTitle(peer),
-      kind: peerKind(peer),
+      ...chatBrief(peer),
       unread: d.unreadCount || (d.isManuallyUnread ? 1 : 0),
       muted: d.isMuted === true,
       pinned: d.isPinned,
       readOutboxMaxId: d.lastReadOutgoing,
       last: last ? this.toMessage(last) : null,
-      canSend: peerCanSend(peer),
     };
   }
 
@@ -506,6 +585,136 @@ export class MtcuteBackend implements AccountBackend {
     }, TRANSFER_TIMEOUT_MS);
   }
 
+  loadAttachment(chatId: number, messageId: number, onProgress?: (done: number, total: number) => void): Promise<LoadedFile | null> {
+    return this.wrap(async (tg) => {
+      const media = this.files.get(`${chatId}:${messageId}`);
+      if (!media) return null;
+      const info = describeFile(media);
+      if ((info.size ?? 0) > MAX_DOWNLOAD_BYTES) {
+        throw new AppError('invalid', '这个文件超过 200MB，请到官方客户端下载。');
+      }
+      const data = await tg.downloadAsBuffer(media, { progressCallback: onProgress });
+      return { data, mime: info.mime, name: info.name };
+    }, TRANSFER_TIMEOUT_MS);
+  }
+
+  loadAttachmentPreview(chatId: number, messageId: number): Promise<LoadedFile | null> {
+    return this.wrap(async (tg) => {
+      const media = this.files.get(`${chatId}:${messageId}`);
+      // 取一张静态小图：动画贴纸、视频封面都用它
+      const thumb = media?.getThumbnail(Thumbnail.THUMB_320x320_BOX) ?? media?.getThumbnail(Thumbnail.THUMB_100x100_BOX);
+      if (!thumb || thumb.isVideo) return null;
+      return { data: await tg.downloadAsBuffer(thumb), mime: 'image/webp', name: '预览' };
+    }, TRANSFER_TIMEOUT_MS);
+  }
+
+  loadAvatar(chatId: number): Promise<Uint8Array | null> {
+    return this.wrap(async (tg) => {
+      const photo = this.avatars.get(chatId);
+      if (!photo) return null;
+      return tg.downloadAsBuffer(photo.small);
+    }, TRANSFER_TIMEOUT_MS);
+  }
+
+  forward(fromChatId: number, messageIds: number[], toChatId: number): Promise<MessageInfo[]> {
+    return this.wrap(async (tg) => {
+      const list = await tg.forwardMessagesById({ fromChatId: this.peer(fromChatId), messages: messageIds, toChatId: this.peer(toChatId) });
+      for (const m of list) this.remember(m);
+      return list.map((m) => this.toMessage(m));
+    });
+  }
+
+  // —— 贴纸 ——
+
+  listStickerSets(): Promise<StickerSetInfo[]> {
+    return this.wrap(async (tg) => {
+      const sets = (await tg.getInstalledStickers()).filter((s) => s.type === 'sticker' && !s.isArchived);
+      this.stickerSets.clear();
+      return sets.map((s) => {
+        const id = s.shortName || String(s.brief.id);
+        this.stickerSets.set(id, s);
+        return { id, title: s.title, count: s.count };
+      });
+    });
+  }
+
+  listStickers(setId: string): Promise<StickerInfo[]> {
+    return this.wrap(async (tg) => {
+      const brief = this.stickerSets.get(setId);
+      if (!brief) throw new AppError('invalid', '这个贴纸包已经不存在了。');
+      const full = brief.isFull ? brief : await tg.getStickerSet(brief.inputStickerSet);
+      return full.stickers.map(({ sticker }) => {
+        const id = sticker.uniqueFileId;
+        remember(this.stickers, id, sticker, STICKER_CACHE_LIMIT);
+        return { id, emoji: sticker.emoji, format: sticker.sourceType };
+      });
+    });
+  }
+
+  loadStickerImage(stickerId: string): Promise<LoadedFile | null> {
+    return this.wrap(async (tg) => {
+      const sticker = this.stickers.get(stickerId);
+      if (!sticker) return null;
+      const thumb = sticker.getThumbnail(Thumbnail.THUMB_320x320_BOX) ?? sticker.getThumbnail(Thumbnail.THUMB_100x100_BOX);
+      if (thumb && !thumb.isVideo) return { data: await tg.downloadAsBuffer(thumb), mime: 'image/webp', name: '贴纸' };
+      // 没有小图时，静态贴纸直接用本体；动画和视频贴纸没法当图片显示
+      if (sticker.sourceType !== 'static') return null;
+      return { data: await tg.downloadAsBuffer(sticker), mime: sticker.mimeType, name: '贴纸' };
+    }, TRANSFER_TIMEOUT_MS);
+  }
+
+  sendSticker(chatId: number, stickerId: string, opts?: SendOptions): Promise<MessageInfo> {
+    return this.wrap(async (tg) => {
+      const sticker = this.stickers.get(stickerId);
+      if (!sticker) throw new AppError('invalid', '请重新打开贴纸面板后再试。');
+      const msg = await tg.sendMedia(this.peer(chatId), InputMedia.sticker(sticker.fileId), { replyTo: opts?.replyToId });
+      this.remember(msg);
+      return this.toMessage(msg);
+    });
+  }
+
+  // —— 群 ——
+
+  createGroup(title: string, members: number[]): Promise<{ dialog: DialogInfo; notAdded: number }> {
+    return this.wrap(async (tg) => {
+      const result = await tg.createGroup({ title, users: members.map((m) => this.peer(m)) });
+      const peer = result.chat;
+      this.rememberPeer(peer);
+      return {
+        dialog: { chatId: peer.id, ...chatBrief(peer), unread: 0, muted: false, pinned: false, readOutboxMaxId: 0, last: null },
+        notAdded: result.missing.length,
+      };
+    });
+  }
+
+  renameGroup(chatId: number, title: string): Promise<void> {
+    return this.wrap((tg) => tg.setChatTitle(this.peer(chatId), title));
+  }
+
+  addMembers(chatId: number, members: number[]): Promise<{ notAdded: number }> {
+    return this.wrap(async (tg) => {
+      const missing = await tg.addChatMembers(
+        this.peer(chatId),
+        members.map((m) => this.peer(m)),
+        { forwardCount: 50 },
+      );
+      return { notAdded: missing.length };
+    });
+  }
+
+  inviteLink(chatId: number): Promise<string> {
+    // 取现有的主邀请链接，不新建（新建会让旧链接作废）
+    return this.wrap(async (tg) => (await tg.getPrimaryInviteLink(this.peer(chatId))).link);
+  }
+
+  groupInfo(chatId: number): Promise<GroupInfo> {
+    return this.wrap(async (tg) => ({ members: (await tg.getFullChat(this.peer(chatId))).membersCount }));
+  }
+
+  leaveGroup(chatId: number): Promise<void> {
+    return this.wrap((tg) => tg.leaveChat(this.peer(chatId)));
+  }
+
   logOut(): Promise<void> {
     return this.wrap(async (tg) => {
       await tg.logOut();
@@ -517,6 +726,10 @@ export class MtcuteBackend implements AccountBackend {
     this.events = null;
     this.peers.clear();
     this.photos.clear();
+    this.files.clear();
+    this.avatars.clear();
+    this.stickerSets.clear();
+    this.stickers.clear();
     try {
       await this.tg.destroy();
     } catch {
