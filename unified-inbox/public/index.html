@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <!-- 安全策略：只允许运行本软件自带的代码；只允许连接本站和官方服务器；禁止任何第三方脚本、图片外链和表单提交 -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self' wss://*.web.telegram.org; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'"
+    />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="theme-color" content="#3a6ff0" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="聚信" />
+    <title>聚信</title>
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" href="./icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="./icon-192.png" />
+    <link rel="stylesheet" href="./app.css" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>本软件需要启用 JavaScript 才能运行。</noscript>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
