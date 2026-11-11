@@ -1,0 +1,27 @@
+{
+  "name": "unified-inbox",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "多账号聚合收件箱：一个窗口登录并回复所有账号的消息（电脑和手机通用）",
+  "dependencies": {
+    "@mtcute/web": "^0.32.8",
+    "preact": "^11.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "start": "node build.mjs && node scripts/serve.mjs dist 4173",
+    "demo": "node build.mjs --demo && node scripts/serve.mjs dist-demo 4174",
+    "typecheck": "tsc -p .",
+    "test": "node --test \"test/*.test.ts\"",
+    "test:e2e": "node test/e2e.cjs"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}
