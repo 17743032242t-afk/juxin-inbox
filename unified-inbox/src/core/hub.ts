@@ -1,0 +1,704 @@
+/**
+ * 汇总中心：同时管理所有账号的连接，把各账号的会话和消息汇成一个收件箱。
+ *
+ * 每条会话都带着「来自哪个账号」，回复时一定从收到消息的那个账号发出，
+ * 不会串号。消息内容只放在内存里，不写入磁盘。
+ */
+import {
+  AppError,
+  errorText,
+  type AccountBackend,
+  type AccountStatus,
+  type BackendFactory,
+  type ChatKind,
+  type DialogInfo,
+  type MessageInfo,
+  type OutgoingFile,
+  type SendOptions,
+  type SentCodeInfo,
+} from './types.ts';
+import type { StoredAccount, Vault } from './vault.ts';
+
+export const ACCOUNT_COLORS = ['#2f7de1', '#e0683a', '#2aa876', '#b455c9', '#d9a514', '#d94a6a', '#1aa3b8', '#7a6ee6'];
+/** 新登录保护期：刚登录的账号这段时间内不参与批量回复 */
+export const NEW_LOGIN_PROTECT_MS = 24 * 60 * 60 * 1000;
+/** 两次登录账号之间建议的最短间隔 */
+export const LOGIN_SPACING_MS = 10 * 60 * 1000;
+/** 一天之内建议最多新登录几个账号 */
+export const LOGINS_PER_DAY_ADVICE = 3;
+/** 单个账号每分钟最多发几条（普通 / 重要账号） */
+export const SEND_LIMIT_PER_MINUTE = 20;
+export const SEND_LIMIT_PER_MINUTE_IMPORTANT = 10;
+const SEND_WINDOW_MS = 60_000;
+const DIALOG_LIMIT = 150;
+const HISTORY_PAGE = 40;
+const MESSAGE_CAP = 600;
+/** 「超级群/频道」的会话编号都小于这个数 */
+const CHANNEL_ID_BASE = -1_000_000_000_000;
+
+export interface AccountView {
+  id: string;
+  label: string;
+  color: string;
+  phone: string;
+  name: string;
+  username: string | null;
+  status: AccountStatus;
+  statusDetail: string | null;
+  unread: number;
+  unreadChats: number;
+  /** 重要账号（开启额外保护） */
+  important: boolean;
+  /** 新登录保护期到什么时候结束；不在保护期为 null */
+  protectedUntil: number | null;
+}
+
+export interface LoginPacing {
+  /** 最近 24 小时已经新登录了几个账号 */
+  last24h: number;
+  /** 距离建议的间隔还差几分钟；0 表示可以登录 */
+  waitMinutes: number;
+}
+
+export interface InboxDialog extends DialogInfo {
+  /** 全局唯一：账号编号 + 会话编号 */
+  key: string;
+  accountId: string;
+}
+
+export interface HistoryState {
+  loaded: boolean;
+  loading: boolean;
+  hasMore: boolean;
+  error: string | null;
+}
+
+interface AccountRuntime {
+  stored: StoredAccount;
+  backend: AccountBackend | null;
+  status: AccountStatus;
+  statusDetail: string | null;
+}
+
+export type IncomingListener = (account: AccountView, dialog: InboxDialog, msg: MessageInfo) => void;
+
+export function dialogKey(accountId: string, chatId: number): string {
+  return `${accountId}:${chatId}`;
+}
+
+function newId(): string {
+  const bytes = new Uint8Array(9);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+export class Hub {
+  private vault: Vault;
+  private factory: BackendFactory;
+  private runtimes = new Map<string, AccountRuntime>();
+  private dialogMap = new Map<string, InboxDialog>();
+  private messageMap = new Map<string, MessageInfo[]>();
+  private historyMap = new Map<string, HistoryState>();
+  private listeners = new Set<() => void>();
+  private notifyQueued = false;
+  private destroyed = false;
+  private sortedCache: InboxDialog[] | null = null;
+
+  /** 当前打开的会话 */
+  activeKey: string | null = null;
+  /** 页面是否在前台（由界面层告知），不在前台时不自动标已读 */
+  isVisible: () => boolean = () => true;
+  onIncoming: IncomingListener | null = null;
+  version = 0;
+  /** 当前时间（测试时可以替换） */
+  now: () => number = () => Date.now();
+  private sendLog = new Map<string, number[]>();
+
+  constructor(vault: Vault, factory: BackendFactory) {
+    this.vault = vault;
+    this.factory = factory;
+    for (const stored of vault.data.accounts) {
+      this.runtimes.set(stored.id, { stored, backend: null, status: 'connecting', statusDetail: null });
+    }
+  }
+
+  // —— 订阅 ——
+
+  subscribe(fn: () => void): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  private changed(): void {
+    this.sortedCache = null;
+    this.version++;
+    if (this.notifyQueued) return;
+    this.notifyQueued = true;
+    queueMicrotask(() => {
+      this.notifyQueued = false;
+      for (const fn of [...this.listeners]) fn();
+    });
+  }
+
+  // —— 读取 ——
+
+  accounts(): AccountView[] {
+    const unread = new Map<string, { n: number; chats: number }>();
+    for (const d of this.dialogMap.values()) {
+      if (d.unread <= 0 || d.muted) continue;
+      const u = unread.get(d.accountId) ?? { n: 0, chats: 0 };
+      u.n += d.unread;
+      u.chats += 1;
+      unread.set(d.accountId, u);
+    }
+    return [...this.runtimes.values()].map((rt) => this.view(rt, unread.get(rt.stored.id)));
+  }
+
+  account(id: string): AccountView | null {
+    const rt = this.runtimes.get(id);
+    return rt ? this.view(rt) : null;
+  }
+
+  private view(rt: AccountRuntime, unread?: { n: number; chats: number }): AccountView {
+    const s = rt.stored;
+    const until = (s.loginAt ?? 0) + NEW_LOGIN_PROTECT_MS;
+    return {
+      id: s.id,
+      label: s.label,
+      color: s.color,
+      phone: s.phone,
+      name: s.name,
+      username: s.username,
+      status: rt.status,
+      statusDetail: rt.statusDetail,
+      unread: unread?.n ?? 0,
+      unreadChats: unread?.chats ?? 0,
+      important: s.important === true,
+      protectedUntil: until > this.now() ? until : null,
+    };
+  }
+
+  /** 这个账号现在能不能参与批量回复；不能时返回原因 */
+  batchBlock(accountId: string): string | null {
+    const rt = this.runtimes.get(accountId);
+    if (!rt) return '账号不存在。';
+    if (rt.stored.important) return '重要账号已开启保护，不参与批量回复。';
+    const until = (rt.stored.loginAt ?? 0) + NEW_LOGIN_PROTECT_MS;
+    if (until > this.now()) {
+      const hours = Math.ceil((until - this.now()) / 3_600_000);
+      return `刚登录的账号 24 小时内不参与批量回复（还剩约 ${hours} 小时）。`;
+    }
+    return null;
+  }
+
+  /** 添加账号前的节奏提醒：短时间内连续登录很多账号容易被官方判为异常 */
+  loginPacing(): LoginPacing {
+    const now = this.now();
+    const times = this.vault.data.accounts.map((a) => a.loginAt ?? 0).filter((t) => t > now - NEW_LOGIN_PROTECT_MS);
+    const last = Math.max(0, ...times);
+    const wait = last + LOGIN_SPACING_MS - now;
+    return { last24h: times.length, waitMinutes: wait > 0 ? Math.ceil(wait / 60_000) : 0 };
+  }
+
+  /** 发送限速：同一个账号一分钟内发太多条会被拦下，避免被官方当成机器刷屏 */
+  private checkSendRate(accountId: string): void {
+    const rt = this.runtimes.get(accountId);
+    const limit = rt?.stored.important ? SEND_LIMIT_PER_MINUTE_IMPORTANT : SEND_LIMIT_PER_MINUTE;
+    const now = this.now();
+    const recent = (this.sendLog.get(accountId) ?? []).filter((t) => t > now - SEND_WINDOW_MS);
+    if (recent.length >= limit) {
+      const seconds = Math.max(1, Math.ceil((recent[0]! + SEND_WINDOW_MS - now) / 1000));
+      throw new AppError(
+        'flood',
+        `账号「${rt?.stored.label ?? '?'}」1 分钟内已发出 ${recent.length} 条。为避免被官方判定为异常，请 ${seconds} 秒后再发。`,
+        seconds,
+      );
+    }
+    recent.push(now);
+    this.sendLog.set(accountId, recent);
+  }
+
+  /** 所有账号的会话合在一起，最新的排最前 */
+  dialogs(): InboxDialog[] {
+    if (!this.sortedCache) {
+      this.sortedCache = [...this.dialogMap.values()].sort((a, b) => (b.last?.date ?? 0) - (a.last?.date ?? 0));
+    }
+    return this.sortedCache;
+  }
+
+  dialog(key: string): InboxDialog | null {
+    return this.dialogMap.get(key) ?? null;
+  }
+
+  messages(key: string): MessageInfo[] {
+    return this.messageMap.get(key) ?? [];
+  }
+
+  history(key: string): HistoryState {
+    return this.historyMap.get(key) ?? { loaded: false, loading: false, hasMore: true, error: null };
+  }
+
+  totalUnread(): number {
+    let n = 0;
+    for (const d of this.dialogMap.values()) if (!d.muted) n += d.unread;
+    return n;
+  }
+
+  // —— 连接 ——
+
+  /** 解锁后调用：所有账号同时上线 */
+  async startAll(): Promise<void> {
+    await Promise.all([...this.runtimes.keys()].map((id) => this.connect(id)));
+  }
+
+  async connect(accountId: string): Promise<void> {
+    const rt = this.runtimes.get(accountId);
+    const api = this.vault.data.api;
+    if (!rt || !api || this.destroyed) return;
+    if (rt.backend) {
+      await rt.backend.destroy();
+      rt.backend = null;
+    }
+    rt.status = 'connecting';
+    rt.statusDetail = null;
+    this.changed();
+    const backend = this.factory(api);
+    rt.backend = backend;
+    this.attach(rt, backend);
+    try {
+      const me = await backend.resume(rt.stored.session);
+      if (this.destroyed || rt.backend !== backend) return;
+      if (me.name !== rt.stored.name || me.username !== rt.stored.username) {
+        rt.stored.name = me.name;
+        rt.stored.username = me.username;
+        void this.vault.save();
+      }
+      rt.status = 'online';
+      this.changed();
+      await this.refreshDialogs(accountId);
+    } catch (e) {
+      if (this.destroyed || rt.backend !== backend) return;
+      const revoked = e instanceof AppError && e.code === 'revoked';
+      rt.status = revoked ? 'revoked' : 'error';
+      rt.statusDetail = errorText(e);
+      this.changed();
+    }
+  }
+
+  async refreshDialogs(accountId: string): Promise<void> {
+    const rt = this.runtimes.get(accountId);
+    if (!rt?.backend) return;
+    const backend = rt.backend;
+    const list = await backend.listDialogs(DIALOG_LIMIT);
+    if (this.destroyed || rt.backend !== backend) return;
+    for (const d of list) {
+      const key = dialogKey(accountId, d.chatId);
+      this.dialogMap.set(key, { ...d, key, accountId });
+    }
+    this.changed();
+  }
+
+  private attach(rt: AccountRuntime, backend: AccountBackend): void {
+    const accountId = rt.stored.id;
+    const live = () => !this.destroyed && rt.backend === backend;
+    backend.setEvents({
+      onMessage: (msg, chat) => {
+        if (live()) this.handleMessage(accountId, msg, chat);
+      },
+      onEdit: (msg) => {
+        if (!live()) return;
+        const key = dialogKey(accountId, msg.chatId);
+        const list = this.messageMap.get(key);
+        const i = list?.findIndex((m) => m.id === msg.id) ?? -1;
+        if (list && i >= 0) list[i] = msg;
+        const d = this.dialogMap.get(key);
+        if (d?.last?.id === msg.id) this.dialogMap.set(key, { ...d, last: msg });
+        this.changed();
+      },
+      onDelete: (chatId, ids) => {
+        if (live()) this.handleDelete(accountId, chatId, ids);
+      },
+      onRead: (chatId, kind, maxId, unread) => {
+        if (!live()) return;
+        const key = dialogKey(accountId, chatId);
+        const d = this.dialogMap.get(key);
+        if (!d) return;
+        if (kind === 'outbox') {
+          this.dialogMap.set(key, { ...d, readOutboxMaxId: Math.max(d.readOutboxMaxId, maxId) });
+        } else {
+          this.dialogMap.set(key, { ...d, unread: unread ?? 0 });
+        }
+        this.changed();
+      },
+      onStatus: (status, detail) => {
+        if (!live()) return;
+        // 已判定失效的登录不会因为重连而「复活」
+        if (rt.status === 'revoked' && status !== 'revoked') return;
+        if (rt.status === status) return;
+        rt.status = status;
+        rt.statusDetail = detail ?? null;
+        this.changed();
+      },
+    });
+  }
+
+  private handleMessage(accountId: string, msg: MessageInfo, chat: { title: string; kind: ChatKind; canSend: boolean }): void {
+    const key = dialogKey(accountId, msg.chatId);
+    const existing = this.dialogMap.get(key);
+    const reading = this.activeKey === key && this.isVisible();
+    const countsAsUnread = !msg.out && chat.kind !== 'self' && !reading;
+    const base: InboxDialog = existing ?? {
+      key,
+      accountId,
+      chatId: msg.chatId,
+      title: chat.title,
+      kind: chat.kind,
+      unread: 0,
+      muted: false,
+      pinned: false,
+      readOutboxMaxId: 0,
+      last: null,
+      canSend: chat.canSend,
+    };
+    const isNewer = !base.last || msg.date >= base.last.date;
+    const dialog: InboxDialog = {
+      ...base,
+      title: chat.title || base.title,
+      last: isNewer ? msg : base.last,
+      unread: msg.out ? 0 : base.unread + (countsAsUnread ? 1 : 0),
+    };
+    this.dialogMap.set(key, dialog);
+    this.insertMessages(key, [msg]);
+    this.changed();
+    // 正在看的会话来了新消息：本地不计未读，但仍要告诉服务器「已读」，否则下次打开又变回未读
+    if (!msg.out && reading) void this.markRead(key, true);
+    if (countsAsUnread && !dialog.muted) {
+      const account = this.account(accountId);
+      if (account) this.onIncoming?.(account, dialog, msg);
+    }
+  }
+
+  private handleDelete(accountId: string, channelId: number | null, ids: number[]): void {
+    const idSet = new Set(ids);
+    const prefix = `${accountId}:`;
+    for (const [key, list] of this.messageMap) {
+      if (!key.startsWith(prefix)) continue;
+      const chatId = Number(key.slice(prefix.length));
+      const isChannel = chatId <= CHANNEL_ID_BASE;
+      if (channelId === null ? isChannel : chatId !== channelId && chatId !== CHANNEL_ID_BASE - channelId) continue;
+      const kept = list.filter((m) => !idSet.has(m.id));
+      if (kept.length === list.length) continue;
+      this.messageMap.set(key, kept);
+      const d = this.dialogMap.get(key);
+      if (d?.last && idSet.has(d.last.id)) this.dialogMap.set(key, { ...d, last: kept.at(-1) ?? null });
+    }
+    this.changed();
+  }
+
+  private insertMessages(key: string, incoming: MessageInfo[]): void {
+    const byId = new Map<number, MessageInfo>();
+    for (const m of this.messageMap.get(key) ?? []) byId.set(m.id, m);
+    for (const m of incoming) byId.set(m.id, m);
+    let list = [...byId.values()].sort((a, b) => a.id - b.id);
+    // 只在「正在看最新消息」时才裁掉太旧的，避免翻历史时被截断
+    if (list.length > MESSAGE_CAP && this.activeKey !== key) list = list.slice(-MESSAGE_CAP);
+    this.messageMap.set(key, list);
+  }
+
+  // —— 会话操作 ——
+
+  private backendFor(key: string): { backend: AccountBackend; dialog: InboxDialog } {
+    const dialog = this.dialogMap.get(key);
+    if (!dialog) throw new AppError('invalid', '找不到这个会话。');
+    const rt = this.runtimes.get(dialog.accountId);
+    if (!rt?.backend || rt.status === 'revoked') {
+      throw new AppError('revoked', `账号「${rt?.stored.label ?? '?'}」的登录已失效，请重新登录后再试。`);
+    }
+    return { backend: rt.backend, dialog };
+  }
+
+  async openChat(key: string | null): Promise<void> {
+    this.activeKey = key;
+    this.changed();
+    if (!key) return;
+    const state = this.history(key);
+    if (!state.loaded && !state.loading) await this.loadHistory(key, false);
+    await this.markRead(key);
+  }
+
+  async loadOlder(key: string): Promise<void> {
+    const state = this.history(key);
+    if (state.loading || !state.hasMore) return;
+    await this.loadHistory(key, true);
+  }
+
+  private async loadHistory(key: string, older: boolean): Promise<void> {
+    const prev = this.history(key);
+    this.historyMap.set(key, { ...prev, loading: true, error: null });
+    this.changed();
+    try {
+      const { backend, dialog } = this.backendFor(key);
+      const oldest = older ? this.messages(key)[0] : undefined;
+      const page = await backend.getHistory(dialog.chatId, oldest ? { id: oldest.id, date: oldest.date } : null, HISTORY_PAGE);
+      if (this.destroyed) return;
+      this.insertMessages(key, page);
+      this.historyMap.set(key, { loaded: true, loading: false, hasMore: page.length >= HISTORY_PAGE, error: null });
+    } catch (e) {
+      this.historyMap.set(key, { ...prev, loading: false, error: errorText(e) });
+    }
+    this.changed();
+  }
+
+  async markRead(key: string, force = false): Promise<void> {
+    const d = this.dialogMap.get(key);
+    if (!d || (d.unread === 0 && !force)) return;
+    if (d.unread !== 0) {
+      this.dialogMap.set(key, { ...d, unread: 0 });
+      this.changed();
+    }
+    try {
+      await this.backendFor(key).backend.markRead(d.chatId);
+    } catch {
+      /* 标已读失败不打扰用户，下次打开会再试 */
+    }
+  }
+
+  private afterSend(key: string, msg: MessageInfo): void {
+    const d = this.dialogMap.get(key);
+    if (d) this.dialogMap.set(key, { ...d, last: msg, unread: 0 });
+    this.insertMessages(key, [msg]);
+    this.changed();
+  }
+
+  /** 从「收到消息的那个账号」发出回复 */
+  async send(key: string, text: string, opts?: SendOptions): Promise<MessageInfo> {
+    const trimmed = text.trim();
+    if (!trimmed) throw new AppError('invalid', '消息内容不能为空。');
+    const { backend, dialog } = this.backendFor(key);
+    if (!dialog.canSend) throw new AppError('forbidden', '没有权限在这个会话里发言。');
+    this.checkSendRate(dialog.accountId);
+    const msg = await backend.sendText(dialog.chatId, trimmed, opts);
+    this.afterSend(key, msg);
+    return msg;
+  }
+
+  async sendFile(key: string, file: OutgoingFile, caption: string, opts?: SendOptions): Promise<MessageInfo> {
+    const { backend, dialog } = this.backendFor(key);
+    if (!dialog.canSend) throw new AppError('forbidden', '没有权限在这个会话里发言。');
+    this.checkSendRate(dialog.accountId);
+    const msg = await backend.sendFile(dialog.chatId, file, caption.trim(), opts);
+    this.afterSend(key, msg);
+    return msg;
+  }
+
+  async edit(key: string, messageId: number, text: string): Promise<void> {
+    const trimmed = text.trim();
+    if (!trimmed) throw new AppError('invalid', '消息内容不能为空。');
+    const { backend, dialog } = this.backendFor(key);
+    const msg = await backend.editText(dialog.chatId, messageId, trimmed);
+    const list = this.messageMap.get(key);
+    const i = list?.findIndex((m) => m.id === messageId) ?? -1;
+    if (list && i >= 0) list[i] = msg;
+    const d = this.dialogMap.get(key);
+    if (d?.last?.id === messageId) this.dialogMap.set(key, { ...d, last: msg });
+    this.changed();
+  }
+
+  async remove(key: string, messageId: number): Promise<void> {
+    const { backend, dialog } = this.backendFor(key);
+    await backend.deleteMessages(dialog.chatId, [messageId]);
+    const kept = this.messages(key).filter((m) => m.id !== messageId);
+    this.messageMap.set(key, kept);
+    const d = this.dialogMap.get(key);
+    if (d?.last?.id === messageId) this.dialogMap.set(key, { ...d, last: kept.at(-1) ?? null });
+    this.changed();
+  }
+
+  async loadPhoto(key: string, messageId: number, size: 'thumb' | 'full'): Promise<Uint8Array | null> {
+    const { backend, dialog } = this.backendFor(key);
+    return backend.loadPhoto(dialog.chatId, messageId, size);
+  }
+
+  // —— 账号管理 ——
+
+  /** 开始添加一个新账号（或给失效的账号重新登录） */
+  beginLogin(): LoginFlow {
+    const api = this.vault.data.api;
+    if (!api) throw new AppError('bad_api', '请先填写接口参数。');
+    return new LoginFlow(this, this.factory(api));
+  }
+
+  /** 由 LoginFlow 在登录成功后调用 */
+  async adopt(backend: AccountBackend, phone: string, label: string, color: string | null, important = false): Promise<string> {
+    const me = await backend.whoAmI();
+    const session = await backend.exportSession();
+    const existing = this.vault.data.accounts.find((a) => a.userId === me.userId);
+    let stored: StoredAccount;
+    if (existing) {
+      // 同一个账号重新登录：替换凭据，不重复添加
+      const old = this.runtimes.get(existing.id);
+      if (old?.backend) await old.backend.destroy();
+      existing.session = session;
+      existing.name = me.name;
+      existing.username = me.username;
+      existing.phone = me.phone ?? phone;
+      if (label.trim()) existing.label = label.trim();
+      if (color) existing.color = color;
+      // 重新登录等于一份全新的登录，保护期重新计算；「重要」标记只会加不会被悄悄去掉
+      existing.loginAt = this.now();
+      if (important) existing.important = true;
+      stored = existing;
+    } else {
+      stored = {
+        id: newId(),
+        label: label.trim() || me.name || phone,
+        color: color ?? ACCOUNT_COLORS[this.vault.data.accounts.length % ACCOUNT_COLORS.length]!,
+        phone: me.phone ?? phone,
+        userId: me.userId,
+        name: me.name,
+        username: me.username,
+        session,
+        loginAt: this.now(),
+        important,
+      };
+      this.vault.data.accounts.push(stored);
+    }
+    await this.vault.save();
+    const rt: AccountRuntime = { stored, backend, status: 'online', statusDetail: null };
+    this.runtimes.set(stored.id, rt);
+    this.attach(rt, backend);
+    this.changed();
+    try {
+      await this.refreshDialogs(stored.id);
+    } catch (e) {
+      rt.statusDetail = errorText(e);
+      this.changed();
+    }
+    return stored.id;
+  }
+
+  async updateAccount(id: string, patch: { label?: string; color?: string; important?: boolean }): Promise<void> {
+    const rt = this.runtimes.get(id);
+    if (!rt) return;
+    if (patch.label !== undefined && patch.label.trim()) rt.stored.label = patch.label.trim();
+    if (patch.color !== undefined) rt.stored.color = patch.color;
+    if (patch.important !== undefined) rt.stored.important = patch.important;
+    await this.vault.save();
+    this.changed();
+  }
+
+  /**
+   * 移除账号。会先在服务器上退出登录，让这份凭据彻底作废，
+   * 再从保险库删除；即使退出登录失败（比如断网），本机的凭据也一定删除。
+   */
+  async removeAccount(id: string): Promise<{ loggedOut: boolean }> {
+    const rt = this.runtimes.get(id);
+    if (!rt) return { loggedOut: false };
+    let loggedOut = false;
+    if (rt.backend) {
+      try {
+        if (rt.status !== 'revoked') {
+          await rt.backend.logOut();
+          loggedOut = true;
+        }
+      } catch {
+        loggedOut = false;
+      }
+      await rt.backend.destroy();
+      rt.backend = null;
+    }
+    this.runtimes.delete(id);
+    this.sendLog.delete(id);
+    this.vault.data.accounts = this.vault.data.accounts.filter((a) => a.id !== id);
+    await this.vault.save();
+    const prefix = `${id}:`;
+    for (const key of [...this.dialogMap.keys()]) {
+      if (!key.startsWith(prefix)) continue;
+      this.dialogMap.delete(key);
+      this.messageMap.delete(key);
+      this.historyMap.delete(key);
+    }
+    if (this.activeKey?.startsWith(prefix)) this.activeKey = null;
+    this.changed();
+    return { loggedOut };
+  }
+
+  /** 全部账号退出登录（用于「清空本机数据」之前） */
+  async logOutAll(): Promise<void> {
+    for (const id of [...this.runtimes.keys()]) await this.removeAccount(id);
+  }
+
+  /** 上锁或关闭时调用：断开所有连接，清掉内存里的消息 */
+  async destroy(): Promise<void> {
+    this.destroyed = true;
+    this.listeners.clear();
+    this.onIncoming = null;
+    const backends = [...this.runtimes.values()].map((rt) => rt.backend);
+    this.runtimes.clear();
+    this.dialogMap.clear();
+    this.messageMap.clear();
+    this.historyMap.clear();
+    this.sortedCache = null;
+    this.activeKey = null;
+    await Promise.all(backends.map((b) => b?.destroy()));
+  }
+}
+
+/** 添加账号的分步流程：手机号 → 验证码 →（两步验证密码）→ 完成 */
+export class LoginFlow {
+  private hub: Hub;
+  private backend: AccountBackend;
+  private phone = '';
+  private finished = false;
+  private authed = false;
+
+  constructor(hub: Hub, backend: AccountBackend) {
+    this.hub = hub;
+    this.backend = backend;
+    backend.setEvents({ onMessage() {}, onEdit() {}, onDelete() {}, onRead() {}, onStatus() {} });
+  }
+
+  async sendCode(phone: string): Promise<SentCodeInfo> {
+    this.phone = phone.replace(/[^\d+]/g, '');
+    return this.backend.sendCode(phone);
+  }
+
+  async submitCode(code: string): Promise<'done' | 'password'> {
+    const result = await this.backend.submitCode(code);
+    if (result === 'done') this.authed = true;
+    return result;
+  }
+
+  passwordHint(): Promise<string | null> {
+    return this.backend.passwordHint().catch(() => null);
+  }
+
+  async submitPassword(password: string): Promise<void> {
+    await this.backend.submitPassword(password);
+    this.authed = true;
+  }
+
+  /** 登录成功后保存到保险库并开始收消息；返回账号编号 */
+  async finish(label: string, color: string | null, important = false): Promise<string> {
+    const id = await this.hub.adopt(this.backend, this.phone, label, color, important);
+    this.finished = true;
+    return id;
+  }
+
+  /**
+   * 中途放弃：断开这次临时连接。
+   * 如果已经登录成功但还没保存，就顺手退出登录，不在服务器上留下没人管的登录。
+   */
+  async cancel(): Promise<void> {
+    if (this.finished) return;
+    this.finished = true;
+    if (this.authed) {
+      try {
+        await this.backend.logOut();
+      } catch {
+        /* 退出失败也继续断开 */
+      }
+    }
+    await this.backend.destroy();
+  }
+}
