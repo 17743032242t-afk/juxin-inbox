@@ -2,7 +2,8 @@ import type { JSX } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { BATCH_DELAY_MAX_MS, MAX_BATCH, batchCandidates, batchExclusions, runBatch, type BatchItem } from '../core/batch.ts';
 import { ACCOUNT_COLORS, LOGINS_PER_DAY_ADVICE, type AccountView, type Hub, type LoginFlow } from '../core/hub.ts';
-import { errorText, type SentCodeInfo } from '../core/types.ts';
+import { qrMatrix, qrPath } from '../core/qr.ts';
+import { AppError, errorText, type SentCodeInfo } from '../core/types.ts';
 import type { QuickReply, Vault } from '../core/vault.ts';
 import { ApiSetup } from './screens.tsx';
 import { AccountChip, ErrorNote, Icon, Modal } from './util.tsx';
@@ -25,10 +26,24 @@ const STATUS_TEXT: Record<AccountView['status'], string> = {
   error: '连接出错',
 };
 
-/** 添加账号：手机号 → 验证码 →（两步验证密码）→ 起备注名 */
+/** 二维码：固定白底黑码，深色模式下也一样，保证手机能扫出来 */
+function QrCode(props: { text: string }): JSX.Element {
+  const matrix = useMemo(() => qrMatrix(props.text), [props.text]);
+  const size = matrix.length;
+  return (
+    <svg class="qr" viewBox={`0 0 ${size} ${size}`} role="img" aria-label="登录二维码" shape-rendering="crispEdges">
+      <rect width={size} height={size} fill="#ffffff" />
+      <path d={qrPath(matrix)} fill="#000000" />
+    </svg>
+  );
+}
+
+type AddStep = 'method' | 'qr' | 'phone' | 'code' | 'password' | 'label';
+
+/** 添加账号：扫码（推荐）或 手机号 + 验证码 →（两步验证密码）→ 起备注名 */
 export function AddAccountModal(props: { hub: Hub; usedColors: string[]; relogin?: AccountView; onClose: () => void }): JSX.Element {
   const flow = useRef<LoginFlow | null>(null);
-  const [step, setStep] = useState<'phone' | 'code' | 'password' | 'label'>('phone');
+  const [step, setStep] = useState<AddStep>('method');
   const [phone, setPhone] = useState(props.relogin?.phone ?? '+86');
   const [code, setCode] = useState('');
   const [password, setPassword] = useState('');
@@ -40,9 +55,14 @@ export function AddAccountModal(props: { hub: Hub; usedColors: string[]; relogin
   const [error, setError] = useState<string | null>(null);
   const [important, setImportant] = useState(props.relogin?.important ?? false);
   const [acceptRisk, setAcceptRisk] = useState(false);
+  const [qrUrl, setQrUrl] = useState<string | null>(null);
+  const [scanned, setScanned] = useState(false);
+  /** 扫码登录遇到两步验证时，等界面把密码交回去 */
+  const answerPassword = useRef<((pw: string) => void) | null>(null);
   // 打开弹窗时算一次，避免输入过程中提示跳来跳去
   const pacing = useMemo(() => props.hub.loginPacing(), []);
   const tooFast = !props.relogin && (pacing.waitMinutes > 0 || pacing.last24h >= LOGINS_PER_DAY_ADVICE);
+  const blocked = tooFast && !acceptRisk;
 
   useEffect(
     () => () => {
@@ -62,6 +82,61 @@ export function AddAccountModal(props: { hub: Hub; usedColors: string[]; relogin
     } finally {
       setBusy(false);
     }
+  };
+
+  const startQr = async () => {
+    await flow.current?.cancel();
+    const f = props.hub.beginLogin();
+    flow.current = f;
+    answerPassword.current = null;
+    setStep('qr');
+    setQrUrl(null);
+    setScanned(false);
+    setError(null);
+    setBusy(false);
+    const mine = () => flow.current === f;
+    try {
+      await f.startQr({
+        onUrl: (url) => {
+          if (!mine()) return;
+          setQrUrl(url);
+          setScanned(false);
+        },
+        onScanned: () => {
+          if (mine()) setScanned(true);
+        },
+        askPassword: (pwHint, wrong) =>
+          new Promise<string>((resolve) => {
+            if (!mine()) return;
+            answerPassword.current = resolve;
+            setHint(pwHint);
+            setPassword('');
+            setError(wrong ? '两步验证密码不正确，请重新输入。' : null);
+            setBusy(false);
+            setStep('password');
+          }),
+      });
+      if (!mine()) return;
+      setBusy(false);
+      setError(null);
+      setStep('label');
+    } catch (e) {
+      if (!mine() || (e instanceof AppError && e.code === 'cancelled')) return;
+      setBusy(false);
+      setQrUrl(null);
+      setError(errorText(e));
+      setStep('qr');
+    }
+  };
+
+  const usePhone = async () => {
+    const old = flow.current;
+    flow.current = null;
+    answerPassword.current = null;
+    setError(null);
+    setBusy(false);
+    setStep('phone');
+    await old?.cancel();
   };
 
   const sendCode = () =>
@@ -84,12 +159,22 @@ export function AddAccountModal(props: { hub: Hub; usedColors: string[]; relogin
       }
     });
 
-  const submitPassword = () =>
-    run(async () => {
+  const submitPassword = () => {
+    const answer = answerPassword.current;
+    if (answer) {
+      // 扫码登录：把密码交回给等待中的登录流程，结果由 startQr 里处理
+      answerPassword.current = null;
+      setBusy(true);
+      setError(null);
+      answer(password);
+      return;
+    }
+    void run(async () => {
       await flow.current!.submitPassword(password);
       setPassword('');
       setStep('label');
     });
+  };
 
   const finish = () =>
     run(async () => {
@@ -98,21 +183,17 @@ export function AddAccountModal(props: { hub: Hub; usedColors: string[]; relogin
     });
 
   const title = props.relogin ? `重新登录「${props.relogin.label}」` : '添加账号';
+  const verifying = step === 'qr' || step === 'phone' || step === 'code' || step === 'password';
   return (
     <Modal title={title} onClose={props.onClose} locked={busy}>
       <ol class="progress">
-        <li class={step === 'phone' ? 'on' : 'done'}>手机号</li>
-        <li class={step === 'code' ? 'on' : step === 'phone' ? '' : 'done'}>验证码</li>
+        <li class={step === 'method' ? 'on' : 'done'}>登录方式</li>
+        <li class={verifying ? 'on' : step === 'label' ? 'done' : ''}>验证</li>
         <li class={step === 'label' ? 'on' : ''}>备注名</li>
       </ol>
 
-      {step === 'phone' ? (
-        <form onSubmit={(e) => { e.preventDefault(); void sendCode(); }}>
-          <label>
-            这个账号的手机号（带国家区号）
-            <input type="tel" value={phone} onInput={(e) => setPhone(e.currentTarget.value)} placeholder="+8613800000000" autofocus autocomplete="off" />
-          </label>
-          <p class="hint">官方会把验证码发到这个账号已登录的官方客户端里（或短信）。验证码只在这里输入，不要告诉任何人。</p>
+      {step === 'method' ? (
+        <div>
           <details class="tips" open={!props.relogin}>
             <summary>登录前请确认（关系到账号会不会被官方判为「环境异常」）</summary>
             <ul>
@@ -136,10 +217,55 @@ export function AddAccountModal(props: { hub: Hub; usedColors: string[]; relogin
               </label>
             </div>
           ) : null}
-          <ErrorNote text={error} />
+          <div class="methods">
+            <button class="method primary" type="button" disabled={blocked} onClick={() => void startQr()}>
+              <b>扫码登录（推荐）</b>
+              <small>用手机上已登录这个账号的官方客户端扫一下，不用输手机号和验证码。</small>
+            </button>
+            <button class="method" type="button" disabled={blocked} onClick={() => void usePhone()}>
+              <b>用手机号和验证码登录</b>
+              <small>身边没有第二台设备可以扫码时用这个（比如正在手机上用本软件）。</small>
+            </button>
+          </div>
           <div class="row end">
             <button class="btn" type="button" onClick={props.onClose}>取消</button>
-            <button class="btn primary" type="submit" disabled={busy || (tooFast && !acceptRisk)}>{busy ? '正在请求…' : '获取验证码'}</button>
+          </div>
+        </div>
+      ) : null}
+
+      {step === 'qr' ? (
+        <div class="qr-step">
+          <div class="qr-box">
+            {qrUrl ? <QrCode text={qrUrl} /> : <div class="qr-wait">{error ? '二维码没有生成' : '正在生成二维码…'}</div>}
+            {scanned ? <div class="qr-scanned" role="status">已扫码，正在确认…</div> : null}
+          </div>
+          <ol class="steps">
+            <li>打开手机上<b>已登录这个账号</b>的官方客户端。</li>
+            <li>进入 <b>设置 → 设备 → 关联桌面设备</b>。</li>
+            <li>扫描上面的二维码，并在手机上确认。</li>
+          </ol>
+          <p class="hint">二维码大约每 30 秒会自动换一张，这是官方的安全规定，直接扫当前显示的即可。</p>
+          <ErrorNote text={error} />
+          <div class="row end">
+            <button class="btn" type="button" onClick={() => void usePhone()}>改用手机号登录</button>
+            {error ? (
+              <button class="btn primary" type="button" onClick={() => void startQr()}>重新生成二维码</button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      {step === 'phone' ? (
+        <form onSubmit={(e) => { e.preventDefault(); void sendCode(); }}>
+          <label>
+            这个账号的手机号（带国家区号）
+            <input type="tel" value={phone} onInput={(e) => setPhone(e.currentTarget.value)} placeholder="+8613800000000" autofocus autocomplete="off" />
+          </label>
+          <p class="hint">官方会把验证码发到这个账号已登录的官方客户端里（或短信）。验证码只在这里输入，不要告诉任何人。</p>
+          <ErrorNote text={error} />
+          <div class="row end">
+            <button class="btn" type="button" onClick={() => void startQr()} disabled={busy}>改用扫码登录</button>
+            <button class="btn primary" type="submit" disabled={busy}>{busy ? '正在请求…' : '获取验证码'}</button>
           </div>
         </form>
       ) : null}
@@ -163,7 +289,7 @@ export function AddAccountModal(props: { hub: Hub; usedColors: string[]; relogin
       ) : null}
 
       {step === 'password' ? (
-        <form onSubmit={(e) => { e.preventDefault(); void submitPassword(); }}>
+        <form onSubmit={(e) => { e.preventDefault(); submitPassword(); }}>
           <p>这个账号开启了两步验证，还需要输入你为它设置的密码。</p>
           <label>
             两步验证密码{hint ? `（提示：${hint}）` : ''}
