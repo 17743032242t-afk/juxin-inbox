@@ -1403,6 +1403,89 @@ label.check {
   background: var(--ok);
 }
 
+/* —— 独立窗口 —— */
+
+.app.popout {
+  display: flex;
+  grid-template-columns: none;
+}
+
+.app.popout > .chat {
+  flex: 1;
+}
+
+.app.popout-account {
+  display: grid;
+  grid-template-columns: minmax(260px, 340px) 1fr;
+}
+
+.head-action {
+  margin-left: auto;
+  width: 36px;
+  height: 36px;
+}
+
+.list-title .head-action {
+  margin-left: 0;
+}
+
+.icon-btn.on {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* —— 表情面板、拖拽发文件 —— */
+
+.emoji-panel {
+  max-height: 210px;
+  overflow-y: auto;
+  padding: 4px 2px 6px;
+  border-top: 1px solid var(--line);
+}
+
+.emoji-group-name {
+  display: block;
+  font-size: 12px;
+  color: var(--text-3);
+  margin: 6px 4px 2px;
+}
+
+.emoji-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(38px, 1fr));
+}
+
+.emoji {
+  height: 38px;
+  border-radius: 8px;
+  font-size: 22px;
+  line-height: 1;
+  font-family: 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji', sans-serif;
+}
+
+.emoji:hover {
+  background: var(--panel-2);
+}
+
+.chat {
+  position: relative;
+}
+
+.drop-hint {
+  position: absolute;
+  inset: 8px;
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  border: 2.5px dashed var(--accent);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 17px;
+  pointer-events: none;
+}
+
 .methods {
   display: grid;
   gap: 10px;
