@@ -371,3 +371,115 @@ test('扫码成功但没保存就取消：会在服务器上退出这份登录',
   assert.equal(vault.data.accounts.length, 0);
   assert.equal(net.revoked.size, 1);
 });
+
+test('独立窗口：会话开在独立窗口里并且有人在看时，新消息不计未读并会通知服务器已读', async () => {
+  const { hub, net, a, ua } = await twoAccounts();
+  const key = dialogKey(a, 101);
+  let watching = true;
+  await hub.attachViewer('w1', key, () => watching);
+  assert.equal(hub.messages(key).length, 1); // 历史已加载
+  assert.equal(hub.dialog(key)?.unread, 0);
+  assert.equal(hub.activeKey, null); // 不占用主窗口
+  assert.ok(hub.poppedOutKeys().has(key));
+  net.deliver(ua, 101, '看得到吗');
+  await flush();
+  assert.equal(hub.dialog(key)?.unread, 0);
+  assert.equal(net.users.get(ua)?.chats.get(101)?.info.unread, 0);
+  // 窗口被别的窗口挡住、没人看：新消息要算未读
+  watching = false;
+  net.deliver(ua, 101, '人呢');
+  await flush();
+  assert.equal(hub.dialog(key)?.unread, 1);
+});
+
+test('独立窗口：可以同时开多个会话，各自独立；主窗口照常使用', async () => {
+  const { hub, net, a, b, ua, ub } = await twoAccounts();
+  await hub.attachViewer('w1', dialogKey(a, 101), () => true);
+  await hub.attachViewer('w2', dialogKey(b, 101), () => true);
+  await hub.openChat(dialogKey(a, 102));
+  net.deliver(ua, 101, '甲1');
+  net.deliver(ub, 101, '乙1');
+  net.deliver(ua, 102, '甲2');
+  await flush();
+  assert.equal(hub.totalUnread(), 0);
+  await hub.send(dialogKey(b, 101), '从独立窗口回复');
+  assert.deepEqual(net.sent.at(-1), { userId: ub, chatId: 101, text: '从独立窗口回复' });
+  // 关掉一个窗口后，那个会话的新消息恢复计未读，另一个不受影响
+  hub.detachViewer('w1');
+  net.deliver(ua, 101, '甲3');
+  net.deliver(ub, 101, '乙2');
+  await flush();
+  assert.equal(hub.dialog(dialogKey(a, 101))?.unread, 1);
+  assert.equal(hub.dialog(dialogKey(b, 101))?.unread, 0);
+});
+
+test('独立窗口：同一个窗口换会话后，原来的会话不再算「在看」', async () => {
+  const { hub, net, a, ua } = await twoAccounts();
+  await hub.attachViewer('acct', dialogKey(a, 101), () => true);
+  await hub.attachViewer('acct', dialogKey(a, 102), () => true);
+  assert.equal(hub.isOpen(dialogKey(a, 101)), false);
+  net.deliver(ua, 101, '旧会话的新消息');
+  await flush();
+  assert.equal(hub.dialog(dialogKey(a, 101))?.unread, 1);
+  assert.equal(hub.dialog(dialogKey(a, 102))?.unread, 0);
+});
+
+test('独立窗口：移除账号或上锁后，不再有任何窗口被当作「在看」', async () => {
+  const { hub, a, b } = await twoAccounts();
+  await hub.attachViewer('w1', dialogKey(a, 101), () => true);
+  await hub.attachViewer('w2', dialogKey(b, 101), () => true);
+  await hub.removeAccount(a);
+  assert.deepEqual([...hub.poppedOutKeys()], [dialogKey(b, 101)]);
+  await hub.destroy();
+  assert.equal(hub.poppedOutKeys().size, 0);
+});
+
+test('只订阅一个会话的窗口：别的会话来消息不会被通知，自己的会话和账号级变化才会', async () => {
+  const { hub, net, a, b, ua, ub } = await twoAccounts();
+  const mine = dialogKey(a, 101);
+  let keyCalls = 0;
+  let globalCalls = 0;
+  const off = hub.subscribeKey(mine, () => keyCalls++);
+  hub.subscribe(() => globalCalls++);
+  await flush();
+  keyCalls = 0;
+  globalCalls = 0;
+  net.deliver(ub, 101, '别的账号');
+  net.deliver(ua, 102, '同账号的别的会话');
+  await flush();
+  assert.equal(keyCalls, 0);
+  assert.ok(globalCalls >= 1);
+  net.deliver(ua, 101, '我的会话');
+  await flush();
+  assert.equal(keyCalls, 1);
+  // 同一时刻来一大批消息，只通知一次（合并刷新）
+  for (let i = 0; i < 50; i++) net.deliver(ua, 101, `连发${i}`);
+  await flush();
+  assert.equal(keyCalls, 2);
+  // 账号级变化（比如改备注名）会通知到
+  await hub.updateAccount(b, { label: '新名字' });
+  await flush();
+  assert.equal(keyCalls, 3);
+  off();
+  net.deliver(ua, 101, '退订以后');
+  await flush();
+  assert.equal(keyCalls, 3);
+});
+
+test('发文件：可以不带说明文字；从收到消息的账号发出；计入发送限速', async () => {
+  const { hub, net, a, ua } = await twoAccounts();
+  const key = dialogKey(a, 101);
+  const data = new TextEncoder().encode('报价内容');
+  const doc = await hub.sendFile(key, { name: '报价单.txt', type: 'text/plain', data, asPhoto: false }, '');
+  assert.equal(doc.media, '[文件] 报价单.txt');
+  const pic = await hub.sendFile(key, { name: 'a.jpg', type: 'image/jpeg', data, asPhoto: true }, '  新款  ');
+  assert.equal(pic.hasPhoto, true);
+  assert.equal(pic.text, '新款');
+  assert.deepEqual(net.files.map((f) => [f.userId, f.chatId, f.name, f.bytes, f.asPhoto]), [
+    [ua, 101, '报价单.txt', data.byteLength, false],
+    [ua, 101, 'a.jpg', data.byteLength, true],
+  ]);
+  assert.equal(hub.dialog(key)?.last?.id, pic.id);
+  for (let i = 2; i < SEND_LIMIT_PER_MINUTE; i++) await hub.send(key, `第${i}条`);
+  await assert.rejects(hub.sendFile(key, { name: 'b.txt', type: '', data, asPhoto: false }, ''), (e: unknown) => e instanceof AppError && e.code === 'flood');
+});
