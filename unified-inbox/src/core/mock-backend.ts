@@ -11,6 +11,7 @@ import {
   type DialogInfo,
   type MessageInfo,
   type OutgoingFile,
+  type QrLoginHandlers,
   type SelfInfo,
   type SendOptions,
   type SentCodeInfo,
@@ -47,6 +48,11 @@ export class MockNetwork {
   latency = 0;
   sent: { userId: number; chatId: number; text: string }[] = [];
   now: () => number = () => Date.now();
+  /** 正在等人扫码的登录；scanQr 会让最早的那个扫码成功 */
+  qrWaiters: ((phone: string) => void)[] = [];
+  /** 二维码显示出来时调用（演示模式用它来模拟「过几秒有人扫了」） */
+  onQrShown: (() => void) | null = null;
+  qrCounter = 0;
   /** 新用户第一次出现时调用（演示模式用它来填充示例会话） */
   onNewUser: ((userId: number) => void) | null = null;
   /** 允许用已保存的凭据恢复「这次运行里还没见过」的用户（界面测试跨刷新时用） */
@@ -135,6 +141,14 @@ export class MockNetwork {
     const maxId = chat.messages.at(-1)?.id ?? 0;
     chat.info.readOutboxMaxId = maxId;
     for (const b of u.listeners) b.emitRead(chatId, 'outbox', maxId, null);
+  }
+
+  /** 模拟用手机上的官方客户端扫了二维码（phone 是扫码的那个账号） */
+  scanQr(phone: string): boolean {
+    const waiter = this.qrWaiters.shift();
+    if (!waiter) return false;
+    waiter(phone);
+    return true;
   }
 
   /** 模拟这份登录在别处被下线 */
@@ -231,6 +245,35 @@ export class MockBackend implements AccountBackend {
     this.user = u;
     this.session = `mock-session:${u.self.userId}:${Math.random().toString(36).slice(2)}`;
     u.listeners.add(this);
+  }
+
+  async qrLogin(handlers: QrLoginHandlers, signal: AbortSignal): Promise<void> {
+    await this.tick();
+    if (signal.aborted) throw new AppError('cancelled', '操作已取消。');
+    handlers.onUrl(`tg://login?token=MOCK-${++this.net.qrCounter}-${'x'.repeat(40)}`, this.net.now() + 30_000);
+    const phone = await new Promise<string>((resolve, reject) => {
+      const waiter = (p: string) => resolve(p);
+      this.net.qrWaiters.push(waiter);
+      signal.addEventListener('abort', () => {
+        this.net.qrWaiters = this.net.qrWaiters.filter((w) => w !== waiter);
+        reject(new AppError('cancelled', '操作已取消。'));
+      });
+      this.net.onQrShown?.();
+    });
+    handlers.onScanned();
+    await this.tick();
+    this.pendingPhone = phone.replace(/[^\d+]/g, '');
+    this.codeOk = true;
+    if (this.pendingPhone.endsWith('2')) {
+      let wrong = false;
+      for (;;) {
+        const pw = await handlers.askPassword('演示密码', wrong);
+        if (signal.aborted) throw new AppError('cancelled', '操作已取消。');
+        if (pw === MOCK_PASSWORD) break;
+        wrong = true;
+      }
+    }
+    this.login();
   }
 
   async exportSession(): Promise<string> {

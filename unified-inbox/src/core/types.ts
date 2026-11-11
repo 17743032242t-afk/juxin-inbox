@@ -67,6 +67,16 @@ export interface BackendEvents {
   onStatus(status: AccountStatus, detail?: string): void;
 }
 
+/** 扫码登录过程中，连接层回调给界面的事件 */
+export interface QrLoginHandlers {
+  /** 有新的二维码内容要显示（官方规定大约每 30 秒换一次） */
+  onUrl(url: string, expiresAt: number): void;
+  /** 手机那边已经扫了，正在确认 */
+  onScanned(): void;
+  /** 这个账号开了两步验证，需要密码；wrong 表示上一次输错了 */
+  askPassword(hint: string | null, wrong: boolean): Promise<string>;
+}
+
 export interface SendOptions {
   replyToId?: number;
 }
@@ -92,6 +102,11 @@ export interface AccountBackend {
   submitCode(code: string): Promise<'done' | 'password'>;
   passwordHint(): Promise<string | null>;
   submitPassword(password: string): Promise<void>;
+  /**
+   * 扫码登录：显示二维码，等用户用手机上已登录的官方客户端扫描确认。
+   * 成功后返回；signal 被取消时抛出 cancelled。
+   */
+  qrLogin(handlers: QrLoginHandlers, signal: AbortSignal): Promise<void>;
   /** 导出登录凭据（极敏感，只能放进加密保险库） */
   exportSession(): Promise<string>;
 

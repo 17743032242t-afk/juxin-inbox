@@ -14,6 +14,7 @@ import {
   type DialogInfo,
   type MessageInfo,
   type OutgoingFile,
+  type QrLoginHandlers,
   type SendOptions,
   type SentCodeInfo,
 } from './types.ts';
@@ -651,11 +652,22 @@ export class LoginFlow {
   private phone = '';
   private finished = false;
   private authed = false;
+  private qrAbort: AbortController | null = null;
 
   constructor(hub: Hub, backend: AccountBackend) {
     this.hub = hub;
     this.backend = backend;
     backend.setEvents({ onMessage() {}, onEdit() {}, onDelete() {}, onRead() {}, onStatus() {} });
+  }
+
+  /**
+   * 扫码登录：二维码内容通过 handlers.onUrl 交给界面显示，
+   * 用户用手机上已登录这个账号的官方客户端扫描并确认后，这个调用才返回。
+   */
+  async startQr(handlers: QrLoginHandlers): Promise<void> {
+    this.qrAbort = new AbortController();
+    await this.backend.qrLogin(handlers, this.qrAbort.signal);
+    this.authed = true;
   }
 
   async sendCode(phone: string): Promise<SentCodeInfo> {
@@ -692,6 +704,7 @@ export class LoginFlow {
   async cancel(): Promise<void> {
     if (this.finished) return;
     this.finished = true;
+    this.qrAbort?.abort();
     if (this.authed) {
       try {
         await this.backend.logOut();

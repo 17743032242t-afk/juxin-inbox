@@ -27,6 +27,7 @@ import {
   type DialogInfo,
   type MessageInfo,
   type OutgoingFile,
+  type QrLoginHandlers,
   type SelfInfo,
   type SendOptions,
   type SentCodeInfo,
@@ -273,8 +274,15 @@ export class MtcuteBackend implements AccountBackend {
    * - 发现登录失效时通知上层。
    * timeoutMs 传 0 表示一直等（用于启动时的自动重连）。
    */
-  private async wrap<T>(fn: (tg: TelegramClient) => Promise<T>, timeoutMs = REQUEST_TIMEOUT_MS): Promise<T> {
+  private async wrap<T>(
+    fn: (tg: TelegramClient, signal: AbortSignal) => Promise<T>,
+    timeoutMs = REQUEST_TIMEOUT_MS,
+    external?: AbortSignal,
+  ): Promise<T> {
     const ctl = new AbortController();
+    const onExternal = () => ctl.abort();
+    if (external?.aborted) ctl.abort();
+    external?.addEventListener('abort', onExternal);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
       if (timeoutMs > 0) {
@@ -285,13 +293,18 @@ export class MtcuteBackend implements AccountBackend {
       }
     });
     try {
-      return await Promise.race([fn(this.tg.withParams({ abortSignal: ctl.signal })), timeout]);
+      return await Promise.race([fn(this.tg.withParams({ abortSignal: ctl.signal }), ctl.signal), timeout]);
     } catch (e) {
-      const err = ctl.signal.aborted ? new AppError('network', '连接官方服务器超时，请检查网络或代理后再试。') : translateError(e);
+      const err = external?.aborted
+        ? new AppError('cancelled', '操作已取消。')
+        : ctl.signal.aborted
+          ? new AppError('network', '连接官方服务器超时，请检查网络或代理后再试。')
+          : translateError(e);
       if (err.code === 'revoked') this.events?.onStatus('revoked', err.message);
       throw err;
     } finally {
       clearTimeout(timer);
+      external?.removeEventListener('abort', onExternal);
     }
   }
 
@@ -344,6 +357,53 @@ export class MtcuteBackend implements AccountBackend {
     return this.wrap(async (tg) => {
       await tg.checkPassword(password);
     });
+  }
+
+  async qrLogin(handlers: QrLoginHandlers, signal: AbortSignal): Promise<void> {
+    // 二维码要一直挂着等人扫，所以整体不设超时；
+    // 但如果迟迟连第一张二维码都拿不到，说明连不上服务器，就不要让人干等。
+    const inner = new AbortController();
+    const forward = () => inner.abort();
+    signal.addEventListener('abort', forward);
+    let gotUrl = false;
+    let timedOut = false;
+    const firstUrlTimer = setTimeout(() => {
+      if (gotUrl) return;
+      timedOut = true;
+      inner.abort();
+    }, REQUEST_TIMEOUT_MS);
+    let wrong = false;
+    try {
+      await this.wrap(
+        async (tg, abortSignal) => {
+          await tg.signInQr({
+            onUrlUpdated: (url, expires) => {
+              gotUrl = true;
+              handlers.onUrl(url, expires.getTime());
+            },
+            onQrScanned: () => handlers.onScanned(),
+            password: async () => {
+              const hint = await tg.getPasswordHint().catch(() => null);
+              return handlers.askPassword(hint, wrong);
+            },
+            invalidPasswordCallback: () => {
+              wrong = true;
+            },
+            abortSignal,
+          });
+        },
+        0,
+        inner.signal,
+      );
+    } catch (e) {
+      if (timedOut && !signal.aborted) {
+        throw new AppError('network', '连接官方服务器超时，请检查网络或代理后再试。');
+      }
+      throw e;
+    } finally {
+      clearTimeout(firstUrlTimer);
+      signal.removeEventListener('abort', forward);
+    }
   }
 
   exportSession(): Promise<string> {
