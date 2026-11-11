@@ -1,5 +1,6 @@
 /** 演示模式的虚构数据：不联网，所有人名和对话都是编的 */
 import { MockNetwork } from './core/mock-backend.ts';
+import type { AttachmentInfo } from './core/types.ts';
 import type { StoredAccount } from './core/vault.ts';
 
 const MIN = 60_000;
@@ -11,7 +12,8 @@ interface DemoChat {
   title: string;
   kind?: 'user' | 'group' | 'channel' | 'bot';
   muted?: boolean;
-  lines: [who: 'in' | 'out', text: string, ago: number, extra?: { sender?: string; photo?: boolean; unread?: boolean }][];
+  hasAvatar?: boolean;
+  lines: [who: 'in' | 'out', text: string, ago: number, extra?: { sender?: string; photo?: boolean; unread?: boolean; file?: Partial<AttachmentInfo> & { name: string } }][];
 }
 
 const DEMO: { phone: string; name: string; label: string; color: string; chats: DemoChat[] }[] = [
@@ -28,6 +30,7 @@ const DEMO: { phone: string; name: string; label: string; color: string; chats: 
           ['in', '上次那批货的报价能再给我发一下吗', 2 * DAY],
           ['out', '好的王总，报价单稍后发您', 2 * DAY - 5 * MIN],
           ['in', '收到了，价格可以', DAY],
+          ['in', '', DAY - MIN, { file: { kind: 'sticker', name: '贴纸', mime: 'image/webp', sticker: { emoji: '👌', format: 'static' } } }],
           ['in', '这周能发货吗？', 6 * MIN, { unread: true }],
           ['in', '我这边比较急', 5 * MIN, { unread: true }],
         ],
@@ -67,6 +70,7 @@ const DEMO: { phone: string; name: string; label: string; color: string; chats: 
         lines: [
           ['out', '纸箱这周能到吗', 8 * HOUR],
           ['in', '周四发车，周五到', 7 * HOUR],
+          ['in', '', 13 * MIN, { file: { name: '物流单.pdf', mime: 'application/pdf', size: 184320 } }],
           ['in', '物流单号发您了，注意查收', 12 * MIN, { unread: true }],
         ],
       },
@@ -107,7 +111,7 @@ export function seedDemo(net: MockNetwork): StoredAccount[] {
     const u = net.ensureUser(acc.phone, acc.name);
     const userId = u.self.userId;
     for (const chat of acc.chats) {
-      net.addChat(userId, chat.id, chat.title, chat.kind ?? 'user', { muted: chat.muted ?? false });
+      net.addChat(userId, chat.id, chat.title, chat.kind ?? 'user', { muted: chat.muted ?? false, hasAvatar: chat.hasAvatar ?? false });
       for (const [who, text, ago, extra] of [...chat.lines].sort((a, b) => b[2] - a[2])) {
         net.seed(userId, chat.id, text, { out: who === 'out', ago, ...extra });
       }
