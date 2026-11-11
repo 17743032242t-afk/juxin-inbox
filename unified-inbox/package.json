@@ -6,11 +6,13 @@
   "description": "多账号聚合收件箱：一个窗口登录并回复所有账号的消息（电脑和手机通用）",
   "dependencies": {
     "@mtcute/web": "^0.32.8",
-    "preact": "^11.2.0"
+    "preact": "^11.2.0",
+    "uqr": "^0.1.3"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",
     "esbuild": "^0.28.2",
+    "jsqr": "^1.4.0",
     "typescript": "^7.0.2"
   },
   "scripts": {
