@@ -127,6 +127,21 @@ export function seedDemo(net: MockNetwork): StoredAccount[] {
 
 /** 演示里每隔一会儿自动来一条新消息，方便看到「实时汇总」的效果 */
 export function startDemoTraffic(net: MockNetwork): void {
+  // 演示扫码登录：二维码显示 5 秒后，模拟「手机扫了」，登录进来一个虚构的新账号
+  let demoPhone = 13800000069;
+  net.onNewUser = (userId) => {
+    if (net.users.get(userId)?.chats.size) return;
+    net.addChat(userId, 1, '新客户 小周');
+    net.seed(userId, 1, '你好，朋友推荐我来的', { ago: 4 * MIN, unread: true });
+    net.addChat(userId, 2, '老同学 大刘');
+    net.seed(userId, 2, '周末聚一下？', { ago: 3 * HOUR });
+  };
+  net.onQrShown = () => {
+    demoPhone += 2; // 保持尾号是单数：模拟连接里尾号为 2 的账号代表「开了两步验证」
+    const phone = `+86${demoPhone}`;
+    setTimeout(() => net.scanQr(phone), 5000);
+  };
+
   const script: [phone: string, chatId: number, text: string, sender?: string][] = [
     ['+8613800000033', 201, '司机电话 138****5521，到了会联系您'],
     ['+8613800000011', 102, '样品费怎么算？'],
